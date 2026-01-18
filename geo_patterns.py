@@ -377,7 +377,10 @@ class LDDMMLoss(nn.Module):
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
-        Weighted alignment loss to all templates.
+        HARD assignment alignment loss: Each sample aligns ONLY to its assigned template.
+
+        This prevents templates from converging to smooth averages by forcing each
+        aligned sample to match its specific assigned template, not a weighted mix.
 
         Args:
             h_aligned: (B, 1, H, W)
@@ -389,16 +392,18 @@ class LDDMMLoss(nn.Module):
         """
         B, K = cluster_probs.shape
 
-        # Expand h_aligned to match templates
-        h_expanded = h_aligned.unsqueeze(1).expand(-1, K, -1, -1, -1)  # (B, K, 1, H, W)
+        # Get hard assignments (argmax)
+        cluster_assigned = torch.argmax(cluster_probs, dim=-1)  # (B,)
 
-        # Compute L2 distance to each template
-        distances = ((h_expanded - templates) ** 2).mean(dim=(2, 3, 4))  # (B, K)
+        # For each sample, compute distance ONLY to its assigned template
+        # Use advanced indexing for efficiency
+        batch_idx = torch.arange(B, device=h_aligned.device)
+        assigned_templates = templates[batch_idx, cluster_assigned]  # (B, 1, H, W)
 
-        # Weight by cluster probabilities
-        weighted_dist = (distances * cluster_probs).sum(dim=1)  # (B,)
+        # L2 distance between aligned sample and its assigned template
+        distances = ((h_aligned - assigned_templates) ** 2).mean(dim=(1, 2, 3))  # (B,)
 
-        return weighted_dist.mean()
+        return distances.mean()
 
     def smoothness_loss(self, v_field):
         """
