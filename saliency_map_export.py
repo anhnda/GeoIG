@@ -502,7 +502,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Generate Integrated Gradients saliency maps for ImageNet-1k'
     )
-    parser.add_argument('--images_per_class', type=int, default=50,
+    parser.add_argument('--images_per_class', type=int, default=100,
                        help='Number of images to sample per class (default: 100)')
     parser.add_argument('--force_resample', action='store_true',
                        help='Force resampling of dataset')
