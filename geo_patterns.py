@@ -91,12 +91,13 @@ class AmortizedPredictor(nn.Module):
             nn.Linear(feature_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1])  # 2 channels (x, y flow)
+            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1]),  # 2 channels (x, y flow)
+            nn.Tanh()  # CRITICAL: Bound velocity to [-1, 1] to prevent explosion
         )
 
         # Initialize velocity field head to predict near-zero (small deformations initially)
-        nn.init.normal_(self.v_head[-1].weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.v_head[-1].bias)
+        nn.init.normal_(self.v_head[-2].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.v_head[-2].bias)
 
     def forward(self, h_i):
         """
@@ -363,10 +364,11 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=0.01, lambda_entropy=0.001):
+    def __init__(self, lambda_smooth=1.0, lambda_entropy=0.1, lambda_magnitude=0.1):
         super().__init__()
-        self.lambda_smooth = lambda_smooth
-        self.lambda_entropy = lambda_entropy
+        self.lambda_smooth = lambda_smooth  # Increased from 0.01 to 1.0
+        self.lambda_entropy = lambda_entropy  # Increased from 0.001 to 0.1
+        self.lambda_magnitude = lambda_magnitude  # L2 penalty on velocity magnitude
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -424,6 +426,19 @@ class LDDMMLoss(nn.Module):
         entropy = -(cluster_probs * torch.log(cluster_probs + 1e-10)).sum(dim=1)
         return entropy.mean()
 
+    def magnitude_loss(self, v_field):
+        """
+        L2 penalty on velocity field magnitude to prevent large deformations.
+
+        Args:
+            v_field: (B, 2, H, W)
+
+        Returns:
+            loss: scalar
+        """
+        magnitude = (v_field ** 2).mean()
+        return magnitude
+
     def forward(self, h_aligned, templates, cluster_probs, v_field):
         """
         Compute total loss.
@@ -440,18 +455,21 @@ class LDDMMLoss(nn.Module):
         loss_align = self.alignment_loss(h_aligned, templates, cluster_probs)
         loss_smooth = self.smoothness_loss(v_field)
         loss_entropy = self.entropy_loss(cluster_probs)
+        loss_magnitude = self.magnitude_loss(v_field)
 
         total_loss = (
             loss_align +
             self.lambda_smooth * loss_smooth +
-            self.lambda_entropy * loss_entropy
+            self.lambda_entropy * loss_entropy +
+            self.lambda_magnitude * loss_magnitude
         )
 
         return {
             'total': total_loss,
             'alignment': loss_align,
             'smoothness': loss_smooth,
-            'entropy': loss_entropy
+            'entropy': loss_entropy,
+            'magnitude': loss_magnitude
         }
 
 
@@ -536,8 +554,13 @@ class LDDMMTrainer:
         # Optimizer
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
 
+        # Learning rate scheduler (reduce on plateau)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+
         # Loss
-        self.criterion = LDDMMLoss(lambda_smooth=0.01, lambda_entropy=0.001).to(device)
+        self.criterion = LDDMMLoss(lambda_smooth=1.0, lambda_entropy=0.1, lambda_magnitude=0.1).to(device)
 
         # Automatic Mixed Precision
         if self.use_amp:
@@ -551,7 +574,8 @@ class LDDMMTrainer:
             'train_loss': [],
             'train_alignment': [],
             'train_smoothness': [],
-            'train_entropy': []
+            'train_entropy': [],
+            'train_magnitude': []
         }
 
     def train_epoch(self, epoch):
@@ -621,6 +645,7 @@ class LDDMMTrainer:
         self.history['train_alignment'].append(avg_losses['alignment'])
         self.history['train_smoothness'].append(avg_losses['smoothness'])
         self.history['train_entropy'].append(avg_losses['entropy'])
+        self.history['train_magnitude'].append(avg_losses['magnitude'])
 
         return avg_losses
 
@@ -640,6 +665,10 @@ class LDDMMTrainer:
             print(f"  Alignment: {avg_losses['alignment']:.4f}")
             print(f"  Smoothness: {avg_losses['smoothness']:.4f}")
             print(f"  Entropy: {avg_losses['entropy']:.4f}")
+            print(f"  Magnitude: {avg_losses['magnitude']:.4f}")
+
+            # Update learning rate scheduler
+            self.scheduler.step(avg_losses['total'])
 
             # Save checkpoint
             if epoch % save_frequency == 0:
