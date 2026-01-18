@@ -536,7 +536,7 @@ class SaliencyMapDataset(Dataset):
 
         # Convert to tensor and add channel dimension
         saliency = torch.from_numpy(item['saliency_map']).float().unsqueeze(0)  # (1, H, W)
-        label = torch.tensor(item['label'], dtype=torch.long)
+        label = torch.tensor(item['true_label'], dtype=torch.long)
 
         return saliency, label
 
