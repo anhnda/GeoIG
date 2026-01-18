@@ -24,6 +24,8 @@ from pathlib import Path
 import argparse
 import joblib
 from tqdm import tqdm
+from PIL import Image
+from torchvision import transforms
 
 # Import model components from geo_patterns
 import sys
@@ -35,13 +37,21 @@ from full_classes import IMAGENET2012_CLASSES
 class PatternVisualizer:
     """Visualize learned patterns and decompositions."""
 
-    def __init__(self, checkpoint_path, data_dir, device='cuda'):
+    def __init__(self, checkpoint_path, data_dir, device='cuda', imagenet_dir=None):
         self.device = device
         self.data_dir = Path(data_dir)
+        self.imagenet_dir = Path(imagenet_dir) if imagenet_dir else None
 
         # ImageNet normalization parameters
         self.mean = np.array([0.485, 0.456, 0.406])
         self.std = np.array([0.229, 0.224, 0.225])
+
+        # Transform for loading ImageNet images
+        self.image_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
 
         # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -124,9 +134,40 @@ class PatternVisualizer:
                 if 'original_image' in item:
                     data_dict['original_image'] = item['original_image']
 
+                # Store image path if available for loading from ImageNet
+                if 'image_path' in item:
+                    data_dict['image_path'] = item['image_path']
+
                 self.saliency_by_class[label].append(data_dict)
 
         print(f"✓ Loaded saliency maps for {len(self.saliency_by_class)} classes")
+
+    def get_original_image(self, sample):
+        """
+        Get original image from sample - either from stored data or load from ImageNet.
+
+        Args:
+            sample: Sample dictionary
+
+        Returns:
+            (H, W, 3) RGB image in [0, 1] range, or None if not available
+        """
+        # Method 1: Image already stored in normalized format
+        if 'original_image' in sample:
+            return self.denormalize_image(sample['original_image'])
+
+        # Method 2: Load from ImageNet directory using image_path
+        if 'image_path' in sample and self.imagenet_dir:
+            try:
+                img_path = self.imagenet_dir / sample['image_path']
+                if img_path.exists():
+                    img = Image.open(img_path).convert('RGB')
+                    img_tensor = self.image_transform(img).numpy()
+                    return self.denormalize_image(img_tensor)
+            except Exception as e:
+                print(f"Warning: Could not load image from {sample.get('image_path')}: {e}")
+
+        return None
 
     def visualize_class_patterns(self, class_id, save_path=None):
         """
@@ -205,7 +246,10 @@ class PatternVisualizer:
         sample = samples[sample_idx]
         saliency_map = sample['saliency_map']
         confidence = sample['confidence']
-        has_original_image = 'original_image' in sample
+
+        # Try to get original image
+        original_image = self.get_original_image(sample)
+        has_original_image = original_image is not None
 
         # Convert to tensor
         h_i = torch.from_numpy(saliency_map).float().unsqueeze(0).unsqueeze(0).to(self.device)  # (1, 1, H, W)
@@ -239,8 +283,7 @@ class PatternVisualizer:
         # Row 1 Col 0: Original Image (if available)
         if has_original_image:
             ax0 = fig.add_subplot(gs[0, 0])
-            original_img = self.denormalize_image(sample['original_image'])
-            ax0.imshow(original_img)
+            ax0.imshow(original_image)
             ax0.set_title('Original Image', fontsize=12, fontweight='bold')
             ax0.axis('off')
             col_offset = 1
@@ -361,7 +404,8 @@ class PatternVisualizer:
         num_samples = min(num_samples, len(samples))
 
         # Check if original images are available
-        has_original_images = 'original_image' in samples[0]
+        first_sample_image = self.get_original_image(samples[0])
+        has_original_images = first_sample_image is not None
         num_cols = 5 if has_original_images else 4
 
         fig, axes = plt.subplots(num_samples, num_cols, figsize=(4*num_cols, 4*num_samples))
@@ -387,10 +431,11 @@ class PatternVisualizer:
 
             # Original Image (if available)
             if has_original_images:
-                original_img = self.denormalize_image(sample['original_image'])
-                axes[i, col].imshow(original_img)
-                axes[i, col].set_title(f'Sample {i}: Original', fontsize=10)
-                axes[i, col].axis('off')
+                original_img = self.get_original_image(sample)
+                if original_img is not None:
+                    axes[i, col].imshow(original_img)
+                    axes[i, col].set_title(f'Sample {i}: Original', fontsize=10)
+                    axes[i, col].axis('off')
                 col += 1
 
             # Original IG
@@ -450,6 +495,8 @@ def main():
                        help='Output directory for saved figures')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use (cuda/cpu)')
+    parser.add_argument('--imagenet_dir', type=str, default=None,
+                       help='Path to ImageNet directory (to load original images if not in saliency data)')
 
     args = parser.parse_args()
 
@@ -465,7 +512,8 @@ def main():
     visualizer = PatternVisualizer(
         checkpoint_path=args.checkpoint,
         data_dir=args.data_dir,
-        device=args.device
+        device=args.device,
+        imagenet_dir=args.imagenet_dir
     )
 
     # Visualize class patterns
