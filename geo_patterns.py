@@ -228,11 +228,12 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
     3. Template Bank: Stores K sub-patterns per class
     """
 
-    def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224)):
+    def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224), device='cuda'):
         super().__init__()
         self.num_classes = num_classes
         self.K = k_subpatterns
         self.res = img_res
+        self.device = device
 
         # 1. Predictor
         self.predictor = AmortizedPredictor(k_subpatterns=k_subpatterns, img_res=img_res)
@@ -240,16 +241,19 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         # 2. Warper
         self.warper = DiffeomorphicWarper(img_res=img_res, num_steps=7)
 
-        # 3. Template Bank (CPU-resident for memory efficiency)
+        # 3. Template Bank (GPU-resident for fast access during training)
         # Shape: (num_classes, K, 1, H, W)
-        self.templates = torch.zeros((num_classes, k_subpatterns, 1, *img_res))
-        self.register_buffer('template_counts', torch.zeros(num_classes, k_subpatterns))
-
+        # Register as buffer so it moves with the model and persists in checkpoints
+        template_size = num_classes * k_subpatterns * 1 * img_res[0] * img_res[1] * 4 / (1024**2)
         print(f"\nLDDMM Pipeline Initialized:")
         print(f"  Classes: {num_classes}")
         print(f"  Sub-patterns per class: {k_subpatterns}")
         print(f"  Resolution: {img_res}")
         print(f"  Total templates: {num_classes * k_subpatterns}")
+        print(f"  Template bank size: {template_size:.1f} MB")
+
+        self.register_buffer('templates', torch.zeros((num_classes, k_subpatterns, 1, *img_res)))
+        self.register_buffer('template_counts', torch.zeros(num_classes, k_subpatterns))
 
     def forward(self, h_i, class_ids=None, update_templates=True):
         """
@@ -287,10 +291,10 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
     @torch.no_grad()
     def _update_template_bank(self, h_aligned, class_ids, cluster_assigned):
         """
-        Update template bank using running average.
+        Update template bank using running average (in-place on GPU).
 
         Args:
-            h_aligned: (B, 1, H, W) - Aligned saliency maps
+            h_aligned: (B, 1, H, W) - Aligned saliency maps on GPU
             class_ids: (B,) - Class indices
             cluster_assigned: (B,) - Assigned cluster indices
         """
@@ -306,10 +310,8 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
             # Use 1/count for true mean
             eta = 1.0 / count
 
-            # Move template to GPU for update, then back to CPU
-            template_gpu = self.templates[c, k].to(h_aligned.device)
-            template_gpu = (1 - eta) * template_gpu + eta * h_aligned[i]
-            self.templates[c, k] = template_gpu.cpu()
+            # Update in-place on GPU (templates buffer is already on GPU)
+            self.templates[c, k] = (1 - eta) * self.templates[c, k] + eta * h_aligned[i]
 
     def get_template(self, class_id, cluster_id=None):
         """
@@ -326,6 +328,19 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
             return self.templates[class_id, cluster_id]
         else:
             return self.templates[class_id]  # All K sub-patterns
+
+    def get_batch_templates(self, class_ids):
+        """
+        Get templates for a batch of classes (optimized for GPU).
+
+        Args:
+            class_ids: (B,) - Tensor of class indices
+
+        Returns:
+            (B, K, 1, H, W) - Templates for each class in the batch
+        """
+        # Use advanced indexing to gather templates efficiently
+        return self.templates[class_ids]  # (B, K, 1, H, W)
 
     def get_dominant_template(self, class_id):
         """Get the most frequently used template for a class."""
@@ -445,7 +460,11 @@ class LDDMMLoss(nn.Module):
 # ==========================================
 
 class SaliencyMapDataset(Dataset):
-    """Dataset for loading pre-computed saliency maps."""
+    """Dataset for loading pre-computed saliency maps with lazy loading.
+
+    This version uses lazy loading to avoid loading all data into CPU memory at once.
+    Instead, it builds an index and loads batches on-demand.
+    """
 
     def __init__(self, data_dir, max_samples_per_class=None):
         self.data_dir = Path(data_dir)
@@ -458,36 +477,62 @@ class SaliencyMapDataset(Dataset):
 
         self.metadata = joblib.load(metadata_path)
 
-        # Load all batches
-        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
-        print(f"Loading {len(batch_files)} batch files...")
+        # Index batch files (don't load data yet)
+        self.batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
+        print(f"Indexing {len(self.batch_files)} batch files...")
 
-        self.samples = []
+        # Build index: (batch_file_idx, item_idx_in_batch) -> label
+        self.sample_index = []
         class_counts = defaultdict(int)
 
-        for batch_file in tqdm(batch_files, desc="Loading batches"):
+        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Indexing batches")):
             batch_data = joblib.load(batch_file)
 
-            for item in batch_data:
+            for item_idx, item in enumerate(batch_data):
                 label = item['true_label']
 
                 # Limit samples per class if specified
                 if max_samples_per_class is None or class_counts[label] < max_samples_per_class:
-                    self.samples.append({
-                        'saliency_map': item['saliency_map'],
-                        'label': label,
-                        'correct': item['correct']
+                    self.sample_index.append({
+                        'batch_idx': batch_idx,
+                        'item_idx': item_idx,
+                        'label': label
                     })
                     class_counts[label] += 1
 
-        print(f"Loaded {len(self.samples)} samples")
+        print(f"Indexed {len(self.sample_index)} samples")
         print(f"Classes represented: {len(class_counts)}")
+        print(f"Memory footprint: ~{len(self.sample_index) * 24 / 1024 / 1024:.2f} MB (index only)")
+
+        # Cache for loaded batches (LRU cache to avoid reloading)
+        self._batch_cache = {}
+        # Keep more batches in memory since we have plenty of RAM
+        # Each batch ~100 samples × 224×224×4 bytes ≈ 20MB
+        # 50 batches ≈ 1GB which is reasonable
+        self._cache_size = 50  # Keep 50 batches in memory
+        print(f"Batch cache size: {self._cache_size} batches (~{self._cache_size * 20} MB)")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.sample_index)
 
     def __getitem__(self, idx):
-        item = self.samples[idx]
+        index_entry = self.sample_index[idx]
+        batch_idx = index_entry['batch_idx']
+        item_idx = index_entry['item_idx']
+
+        # Load batch from cache or disk
+        if batch_idx not in self._batch_cache:
+            # Evict oldest batch if cache is full
+            if len(self._batch_cache) >= self._cache_size:
+                oldest_key = next(iter(self._batch_cache))
+                del self._batch_cache[oldest_key]
+
+            # Load batch from disk
+            batch_file = self.batch_files[batch_idx]
+            self._batch_cache[batch_idx] = joblib.load(batch_file)
+
+        # Get item from cached batch
+        item = self._batch_cache[batch_idx][item_idx]
 
         # Convert to tensor and add channel dimension
         saliency = torch.from_numpy(item['saliency_map']).float().unsqueeze(0)  # (1, H, W)
@@ -536,22 +581,16 @@ class LDDMMTrainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
 
         for batch_idx, (saliency_maps, labels) in enumerate(pbar):
-            saliency_maps = saliency_maps.to(self.device)
-            labels = labels.to(self.device)
+            saliency_maps = saliency_maps.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
 
             # Forward pass
             h_aligned, cluster_probs, phi = self.model(
                 saliency_maps, class_ids=labels, update_templates=True
             )
 
-            # Get templates for this batch (from model's current templates)
-            # For loss computation, use current templates
-            batch_templates = []
-            for i, label in enumerate(labels):
-                templates = self.model.get_template(label.item())  # (K, 1, H, W)
-                batch_templates.append(templates)
-
-            batch_templates = torch.stack(batch_templates).to(self.device)  # (B, K, 1, H, W)
+            # Get templates for this batch (optimized batched access on GPU)
+            batch_templates = self.model.get_batch_templates(labels)  # (B, K, 1, H, W)
 
             # Compute velocity field (for smoothness loss)
             _, v_low = self.model.predictor(saliency_maps)
@@ -570,11 +609,19 @@ class LDDMMTrainer:
                 epoch_losses[key] += value.item()
             num_batches += 1
 
-            # Update progress bar
-            pbar.set_postfix({
+            # Update progress bar with GPU memory usage
+            postfix_dict = {
                 'loss': losses['total'].item(),
                 'align': losses['alignment'].item(),
-            })
+            }
+            if torch.cuda.is_available():
+                gpu_mem_used = torch.cuda.memory_allocated() / (1024**3)
+                postfix_dict['GPU_GB'] = f'{gpu_mem_used:.1f}'
+            pbar.set_postfix(postfix_dict)
+
+            # Periodic GPU memory cleanup
+            if batch_idx % 100 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # Average losses
         avg_losses = {key: value / num_batches for key, value in epoch_losses.items()}
@@ -687,6 +734,8 @@ def main():
                        help='Max samples per class (default: None = all)')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
                        help='Checkpoint directory')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers (default: 4)')
 
     args = parser.parse_args()
 
@@ -696,6 +745,12 @@ def main():
     print(f"Geodesic Pattern Learning via LDDMM")
     print(f"{'='*80}")
     print(f"Device: {device}")
+
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"Total GPU Memory: {total_mem:.1f} GB")
+        torch.cuda.empty_cache()  # Clear cache before starting
 
     # Load dataset
     print(f"\nLoading saliency maps from {args.data_dir}...")
@@ -708,15 +763,25 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=True if torch.cuda.is_available() else False,
+        prefetch_factor=2 if args.num_workers > 0 else None,  # Prefetch 2 batches per worker
+        persistent_workers=True if args.num_workers > 0 else False  # Keep workers alive between epochs
     )
 
+    print(f"\nDataLoader Configuration:")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Num workers: {args.num_workers}")
+    print(f"  Pin memory: {True if torch.cuda.is_available() else False}")
+    print(f"  Prefetch factor: {2 if args.num_workers > 0 else None}")
+
     # Create model
+    print(f"\nInitializing LDDMM model...")
     model = LDDMM_GlobalPatternPipeline(
         num_classes=args.num_classes,
         k_subpatterns=args.k_subpatterns,
-        img_res=(224, 224)
+        img_res=(224, 224),
+        device=device
     )
 
     # Create trainer
@@ -728,6 +793,18 @@ def main():
         checkpoint_dir=args.checkpoint_dir
     )
 
+    # Print expected memory usage
+    if torch.cuda.is_available():
+        print(f"\nEstimated GPU Memory Usage:")
+        template_mem = args.num_classes * args.k_subpatterns * 1 * 224 * 224 * 4 / (1024**3)
+        batch_mem = args.batch_size * 1 * 224 * 224 * 4 / (1024**3)
+        model_mem = sum(p.numel() * 4 for p in model.parameters()) / (1024**3)
+        print(f"  Template bank: ~{template_mem:.2f} GB")
+        print(f"  Model parameters: ~{model_mem:.2f} GB")
+        print(f"  Batch data: ~{batch_mem:.2f} GB")
+        print(f"  Estimated total: ~{template_mem + model_mem + batch_mem * 3:.2f} GB")
+        print(f"  Available: {total_mem:.1f} GB")
+
     # Train
     trainer.train(num_epochs=args.epochs, save_frequency=5)
 
@@ -735,6 +812,11 @@ def main():
     trainer.plot_training_curves(
         save_path=Path(args.checkpoint_dir) / 'training_curves.png'
     )
+
+    if torch.cuda.is_available():
+        print(f"\nFinal GPU Memory Usage:")
+        print(f"  Allocated: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+        print(f"  Cached: {torch.cuda.memory_reserved() / (1024**3):.2f} GB")
 
     print(f"\n✓ All done!")
 
