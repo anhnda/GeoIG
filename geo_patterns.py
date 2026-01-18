@@ -742,7 +742,7 @@ def main():
                        help='Number of classes (default: 1000)')
     parser.add_argument('--k_subpatterns', type=int, default=10,
                        help='Number of sub-patterns per class (default: 10)')
-    parser.add_argument('--epochs', type=int, default=50,
+    parser.add_argument('--epochs', type=int, default=10,
                        help='Number of training epochs (default: 50)')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size (default: 64)')
