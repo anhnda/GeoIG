@@ -87,17 +87,18 @@ class AmortizedPredictor(nn.Module):
 
         # Head 2: Velocity Field (predict at lower resolution for smoothness)
         self.v_res = (28, 28)  # Low-res velocity field
+        self.velocity_scale = 3.0  # Scale factor for Tanh (allows deformations up to ±3 pixels)
         self.v_head = nn.Sequential(
             nn.Linear(feature_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1])  # 2 channels (x, y flow)
-            # Removed Tanh() to allow larger deformations
+            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1]),  # 2 channels (x, y flow)
+            nn.Tanh()  # Bound to [-1, 1], then scale
         )
 
         # Initialize velocity field head to predict near-zero (small deformations initially)
-        nn.init.normal_(self.v_head[-1].weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.v_head[-1].bias)
+        nn.init.normal_(self.v_head[-2].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.v_head[-2].bias)
 
     def forward(self, h_i):
         """
@@ -116,9 +117,9 @@ class AmortizedPredictor(nn.Module):
         # Predict cluster assignment
         cluster_logits = self.assignment_head(features)
 
-        # Predict velocity field
-        v_flat = self.v_head(features)
-        v_low = v_flat.view(B, 2, *self.v_res)
+        # Predict velocity field (Tanh bounded, then scaled)
+        v_flat = self.v_head(features)  # Already Tanh'ed, in [-1, 1]
+        v_low = v_flat.view(B, 2, *self.v_res) * self.velocity_scale  # Scale to [-3, 3]
 
         return cluster_logits, v_low
 
@@ -229,12 +230,13 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
     3. Template Bank: Stores K sub-patterns per class
     """
 
-    def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224), device='cuda'):
+    def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224), device='cuda', temperature=0.1):
         super().__init__()
         self.num_classes = num_classes
         self.K = k_subpatterns
         self.res = img_res
         self.device = device
+        self.temperature = temperature  # Lower = more confident assignments
 
         # 1. Predictor
         self.predictor = AmortizedPredictor(k_subpatterns=k_subpatterns, img_res=img_res)
@@ -252,6 +254,7 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         print(f"  Resolution: {img_res}")
         print(f"  Total templates: {num_classes * k_subpatterns}")
         print(f"  Template bank size: {template_size:.1f} MB")
+        print(f"  Softmax temperature: {temperature} (lower = more confident)")
 
         self.register_buffer('templates', torch.zeros((num_classes, k_subpatterns, 1, *img_res)))
         self.register_buffer('template_counts', torch.zeros(num_classes, k_subpatterns))
@@ -275,7 +278,8 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
 
         # Step 1: Predict velocity field and cluster assignment
         cluster_logits, v_low = self.predictor(h_i)
-        cluster_probs = F.softmax(cluster_logits, dim=-1)
+        # Apply temperature to softmax (lower temp = more confident)
+        cluster_probs = F.softmax(cluster_logits / self.temperature, dim=-1)
         cluster_assigned = torch.argmax(cluster_probs, dim=-1)  # Hard assignment for updates
 
         # Step 2: Compute diffeomorphism (Exp map)
@@ -584,12 +588,12 @@ class LDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
-        # Loss
+        # Loss (REBALANCED)
         self.criterion = LDDMMLoss(
-            lambda_smooth=0.01,      # Allow complex deformations
-            lambda_entropy=1.0,      # Confident per-sample assignments
-            lambda_magnitude=0.01,   # Allow bigger velocities
-            lambda_diversity=1.0     # Force using all K patterns!
+            lambda_smooth=0.1,       # Moderate smoothness
+            lambda_entropy=0.0,      # DISABLED - was causing uniform outputs
+            lambda_magnitude=0.0001, # DRASTICALLY reduced - was dominating
+            lambda_diversity=10.0    # INCREASED - force pattern usage!
         ).to(device)
 
         # Automatic Mixed Precision
@@ -832,7 +836,8 @@ def main():
         num_classes=args.num_classes,
         k_subpatterns=args.k_subpatterns,
         img_res=(224, 224),
-        device=device
+        device=device,
+        temperature=0.1  # Low temperature for confident assignments
     )
 
     # Create trainer
