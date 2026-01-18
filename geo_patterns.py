@@ -368,12 +368,13 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0):
+    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0):
         super().__init__()
         self.lambda_smooth = lambda_smooth  # REDUCED: allow complex deformations
         self.lambda_entropy = lambda_entropy  # INCREASED: force diverse clustering!
         self.lambda_magnitude = lambda_magnitude  # REDUCED: allow bigger deformations
         self.lambda_diversity = lambda_diversity  # NEW: encourage using all patterns
+        self.lambda_template_diversity = lambda_template_diversity  # NEW: force templates to be DIFFERENT from each other!
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -470,6 +471,42 @@ class LDDMMLoss(nn.Module):
         """
         magnitude = (v_field ** 2).mean()
         return magnitude
+
+    def template_diversity_loss(self, templates):
+        """
+        Penalize templates for being too similar to each other.
+
+        This prevents all K templates from converging to the same smooth blob.
+        We want templates to be DISTINCT spatial patterns.
+
+        Method: For each pair of templates, compute negative cosine similarity.
+        Minimizing this encourages low similarity (orthogonal patterns).
+
+        Args:
+            templates: (B, K, 1, H, W) - Templates for batch
+
+        Returns:
+            loss: scalar (negative avg pairwise similarity - minimize to maximize diversity)
+        """
+        B, K = templates.shape[0], templates.shape[1]
+
+        # Flatten templates: (B, K, H*W)
+        templates_flat = templates.reshape(B, K, -1)
+
+        # Normalize for cosine similarity
+        templates_norm = F.normalize(templates_flat, p=2, dim=-1)  # (B, K, H*W)
+
+        # Compute pairwise cosine similarities: (B, K, K)
+        similarity_matrix = torch.bmm(templates_norm, templates_norm.transpose(1, 2))  # (B, K, K)
+
+        # Mask out diagonal (self-similarity)
+        mask = torch.eye(K, device=templates.device).unsqueeze(0).expand(B, -1, -1)  # (B, K, K)
+        similarity_matrix = similarity_matrix * (1 - mask)
+
+        # Average absolute similarity (we want this LOW)
+        avg_similarity = torch.abs(similarity_matrix).sum() / (B * K * (K - 1))
+
+        return avg_similarity  # Minimize this = maximize diversity
 
     def forward(self, h_aligned, templates, cluster_probs, v_field):
         """
@@ -596,9 +633,9 @@ class LDDMMTrainer:
         # Loss (REBALANCED)
         self.criterion = LDDMMLoss(
             lambda_smooth=0.1,       # Moderate smoothness
-            lambda_entropy=0.0,      # DISABLED - was causing uniform outputs
+            lambda_entropy=2.0,      # Re-enabled! Encourage sparse assignments per sample
             lambda_magnitude=0.0001, # DRASTICALLY reduced - was dominating
-            lambda_diversity=10.0    # INCREASED - force pattern usage!
+            lambda_diversity=3.0     # Reduced - balance with entropy for sparse but diverse patterns
         ).to(device)
 
         # Automatic Mixed Precision
