@@ -375,7 +375,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='Visualize learned patterns from LDDMM model'
     )
-    parser.add_argument('--checkpoint', type=str, required=True,
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/lddmm_model_final.pth',
                        help='Path to model checkpoint')
     parser.add_argument('--data_dir', type=str,
                        default='./data/saliency_imagenet1k_resnet50_100',
