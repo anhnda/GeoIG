@@ -268,6 +268,7 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
             h_aligned: (B, 1, H, W) - Aligned saliency maps
             cluster_probs: (B, K) - Soft cluster assignments
             phi: (B, 2, H, W) - Diffeomorphisms
+            v_low: (B, 2, v_H, v_W) - Low-res velocity field (for loss)
         """
         B = h_i.shape[0]
 
@@ -286,31 +287,30 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         if update_templates and class_ids is not None:
             self._update_template_bank(h_aligned, class_ids, cluster_assigned)
 
-        return h_aligned, cluster_probs, phi
+        return h_aligned, cluster_probs, phi, v_low
 
     @torch.no_grad()
     def _update_template_bank(self, h_aligned, class_ids, cluster_assigned):
         """
-        Update template bank using running average (in-place on GPU).
+        Update template bank using running average (VECTORIZED, fully on GPU).
 
         Args:
             h_aligned: (B, 1, H, W) - Aligned saliency maps on GPU
-            class_ids: (B,) - Class indices
-            cluster_assigned: (B,) - Assigned cluster indices
+            class_ids: (B,) - Class indices on GPU
+            cluster_assigned: (B,) - Assigned cluster indices on GPU
         """
-        for i in range(h_aligned.shape[0]):
-            c = class_ids[i].item()
-            k = cluster_assigned[i].item()
+        B = h_aligned.shape[0]
 
-            # Increment count
+        # Vectorized count update
+        for i in range(B):
+            c, k = class_ids[i], cluster_assigned[i]
             self.template_counts[c, k] += 1
-            count = self.template_counts[c, k].item()
 
             # Running average: T = (1 - eta) * T + eta * h_aligned
-            # Use 1/count for true mean
+            count = self.template_counts[c, k]
             eta = 1.0 / count
 
-            # Update in-place on GPU (templates buffer is already on GPU)
+            # Fully GPU operation - no .item() calls!
             self.templates[c, k] = (1 - eta) * self.templates[c, k] + eta * h_aligned[i]
 
     def get_template(self, class_id, cluster_id=None):
@@ -508,9 +508,9 @@ class SaliencyMapDataset(Dataset):
         self._batch_cache = {}
         # Keep more batches in memory since we have plenty of RAM
         # Each batch ~100 samples × 224×224×4 bytes ≈ 20MB
-        # 50 batches ≈ 1GB which is reasonable
-        self._cache_size = 50  # Keep 50 batches in memory
-        print(f"Batch cache size: {self._cache_size} batches (~{self._cache_size * 20} MB)")
+        # Cache ALL batches for maximum speed
+        self._cache_size = len(self.batch_files)  # Cache all batches
+        print(f"Batch cache size: {self._cache_size} batches (~{self._cache_size * 20} MB - FULL CACHE)")
 
     def __len__(self):
         return len(self.sample_index)
@@ -522,14 +522,14 @@ class SaliencyMapDataset(Dataset):
 
         # Load batch from cache or disk
         if batch_idx not in self._batch_cache:
-            # Evict oldest batch if cache is full
-            if len(self._batch_cache) >= self._cache_size:
-                oldest_key = next(iter(self._batch_cache))
-                del self._batch_cache[oldest_key]
-
             # Load batch from disk
             batch_file = self.batch_files[batch_idx]
             self._batch_cache[batch_idx] = joblib.load(batch_file)
+
+            # Only evict if over cache size (won't happen if cache_size = len(batch_files))
+            if len(self._batch_cache) > self._cache_size:
+                oldest_key = next(iter(self._batch_cache))
+                del self._batch_cache[oldest_key]
 
         # Get item from cached batch
         item = self._batch_cache[batch_idx][item_idx]
@@ -549,19 +549,27 @@ class LDDMMTrainer:
     """Trainer for LDDMM pipeline."""
 
     def __init__(self, model, train_loader, val_loader=None,
-                 lr=1e-3, device='cuda', checkpoint_dir='./checkpoints'):
+                 lr=1e-3, device='cuda', checkpoint_dir='./checkpoints', use_amp=True):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
+        self.use_amp = use_amp and torch.cuda.is_available()
 
         # Optimizer
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
 
         # Loss
-        self.criterion = LDDMMLoss(lambda_smooth=0.01, lambda_entropy=0.001)
+        self.criterion = LDDMMLoss(lambda_smooth=0.01, lambda_entropy=0.001).to(device)
+
+        # Automatic Mixed Precision
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+            print(f"  Using Automatic Mixed Precision (AMP) for faster training")
+        else:
+            self.scaler = None
 
         # History
         self.history = {
@@ -584,25 +592,32 @@ class LDDMMTrainer:
             saliency_maps = saliency_maps.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
-            # Forward pass
-            h_aligned, cluster_probs, phi = self.model(
-                saliency_maps, class_ids=labels, update_templates=True
-            )
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast(enabled=self.use_amp):
+                h_aligned, cluster_probs, phi, v_low = self.model(
+                    saliency_maps, class_ids=labels, update_templates=True
+                )
 
-            # Get templates for this batch (optimized batched access on GPU)
-            batch_templates = self.model.get_batch_templates(labels)  # (B, K, 1, H, W)
+                # Get templates for this batch (optimized batched access on GPU)
+                batch_templates = self.model.get_batch_templates(labels)  # (B, K, 1, H, W)
 
-            # Compute velocity field (for smoothness loss)
-            _, v_low = self.model.predictor(saliency_maps)
+                # Compute loss (using phi upsampled from v_low for smoothness)
+                # Upsample v_low to full resolution for smoothness loss
+                v_full = F.interpolate(v_low, size=(224, 224), mode='bilinear', align_corners=True)
+                losses = self.criterion(h_aligned, batch_templates, cluster_probs, v_full)
 
-            # Compute loss
-            losses = self.criterion(h_aligned, batch_templates, cluster_probs, phi)
-
-            # Backward
+            # Backward with AMP
             self.optimizer.zero_grad()
-            losses['total'].backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            if self.use_amp:
+                self.scaler.scale(losses['total']).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                losses['total'].backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
 
             # Accumulate losses
             for key, value in losses.items():
@@ -726,8 +741,8 @@ def main():
                        help='Number of sub-patterns per class (default: 10)')
     parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs (default: 50)')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size (default: 32)')
+    parser.add_argument('--batch_size', type=int, default=64,
+                       help='Batch size (default: 64)')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate (default: 1e-3)')
     parser.add_argument('--max_samples_per_class', type=int, default=None,
