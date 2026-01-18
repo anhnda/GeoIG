@@ -91,13 +91,13 @@ class AmortizedPredictor(nn.Module):
             nn.Linear(feature_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1]),  # 2 channels (x, y flow)
-            nn.Tanh()  # CRITICAL: Bound velocity to [-1, 1] to prevent explosion
+            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1])  # 2 channels (x, y flow)
+            # Removed Tanh() to allow larger deformations
         )
 
         # Initialize velocity field head to predict near-zero (small deformations initially)
-        nn.init.normal_(self.v_head[-2].weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.v_head[-2].bias)
+        nn.init.normal_(self.v_head[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.v_head[-1].bias)
 
     def forward(self, h_i):
         """
@@ -364,11 +364,12 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=1.0, lambda_entropy=0.1, lambda_magnitude=0.1):
+    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0):
         super().__init__()
-        self.lambda_smooth = lambda_smooth  # Increased from 0.01 to 1.0
-        self.lambda_entropy = lambda_entropy  # Increased from 0.001 to 0.1
-        self.lambda_magnitude = lambda_magnitude  # L2 penalty on velocity magnitude
+        self.lambda_smooth = lambda_smooth  # REDUCED: allow complex deformations
+        self.lambda_entropy = lambda_entropy  # INCREASED: force diverse clustering!
+        self.lambda_magnitude = lambda_magnitude  # REDUCED: allow bigger deformations
+        self.lambda_diversity = lambda_diversity  # NEW: encourage using all patterns
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -414,7 +415,7 @@ class LDDMMLoss(nn.Module):
 
     def entropy_loss(self, cluster_probs):
         """
-        Entropy regularization to encourage confident assignments.
+        Entropy regularization to encourage confident assignments (LOW entropy per sample).
 
         Args:
             cluster_probs: (B, K)
@@ -422,9 +423,31 @@ class LDDMMLoss(nn.Module):
         Returns:
             loss: scalar
         """
-        # H(p) = -sum(p * log(p))
+        # H(p) = -sum(p * log(p)) - we want this LOW (confident)
         entropy = -(cluster_probs * torch.log(cluster_probs + 1e-10)).sum(dim=1)
         return entropy.mean()
+
+    def diversity_loss(self, cluster_probs):
+        """
+        Diversity loss to encourage using all K patterns (HIGH entropy of cluster distribution).
+
+        Encourages cluster_probs.mean(dim=0) to be uniform [1/K, 1/K, ..., 1/K]
+
+        Args:
+            cluster_probs: (B, K)
+
+        Returns:
+            loss: scalar (negative of entropy - minimize this = maximize diversity)
+        """
+        # Average assignment probabilities across batch: (K,)
+        avg_cluster_usage = cluster_probs.mean(dim=0)
+
+        # Entropy of cluster usage distribution - we want this HIGH
+        cluster_entropy = -(avg_cluster_usage * torch.log(avg_cluster_usage + 1e-10)).sum()
+
+        # Return NEGATIVE (so minimizing this loss = maximizing diversity)
+        max_entropy = np.log(cluster_probs.shape[1])  # log(K)
+        return max_entropy - cluster_entropy  # Minimize this = maximize cluster_entropy
 
     def magnitude_loss(self, v_field):
         """
@@ -454,13 +477,15 @@ class LDDMMLoss(nn.Module):
         """
         loss_align = self.alignment_loss(h_aligned, templates, cluster_probs)
         loss_smooth = self.smoothness_loss(v_field)
-        loss_entropy = self.entropy_loss(cluster_probs)
+        loss_entropy = self.entropy_loss(cluster_probs)  # Per-sample confidence
+        loss_diversity = self.diversity_loss(cluster_probs)  # Batch-level diversity
         loss_magnitude = self.magnitude_loss(v_field)
 
         total_loss = (
             loss_align +
             self.lambda_smooth * loss_smooth +
             self.lambda_entropy * loss_entropy +
+            self.lambda_diversity * loss_diversity +
             self.lambda_magnitude * loss_magnitude
         )
 
@@ -469,6 +494,7 @@ class LDDMMLoss(nn.Module):
             'alignment': loss_align,
             'smoothness': loss_smooth,
             'entropy': loss_entropy,
+            'diversity': loss_diversity,
             'magnitude': loss_magnitude
         }
 
@@ -559,7 +585,12 @@ class LDDMMTrainer:
             self.optimizer, mode='min', factor=0.5, patience=5)
 
         # Loss
-        self.criterion = LDDMMLoss(lambda_smooth=1.0, lambda_entropy=0.1, lambda_magnitude=0.1).to(device)
+        self.criterion = LDDMMLoss(
+            lambda_smooth=0.01,      # Allow complex deformations
+            lambda_entropy=1.0,      # Confident per-sample assignments
+            lambda_magnitude=0.01,   # Allow bigger velocities
+            lambda_diversity=1.0     # Force using all K patterns!
+        ).to(device)
 
         # Automatic Mixed Precision
         if self.use_amp:
@@ -574,6 +605,7 @@ class LDDMMTrainer:
             'train_alignment': [],
             'train_smoothness': [],
             'train_entropy': [],
+            'train_diversity': [],
             'train_magnitude': []
         }
 
@@ -644,6 +676,7 @@ class LDDMMTrainer:
         self.history['train_alignment'].append(avg_losses['alignment'])
         self.history['train_smoothness'].append(avg_losses['smoothness'])
         self.history['train_entropy'].append(avg_losses['entropy'])
+        self.history['train_diversity'].append(avg_losses['diversity'])
         self.history['train_magnitude'].append(avg_losses['magnitude'])
 
         return avg_losses
@@ -663,7 +696,8 @@ class LDDMMTrainer:
             print(f"  Total Loss: {avg_losses['total']:.4f}")
             print(f"  Alignment: {avg_losses['alignment']:.4f}")
             print(f"  Smoothness: {avg_losses['smoothness']:.4f}")
-            print(f"  Entropy: {avg_losses['entropy']:.4f}")
+            print(f"  Entropy: {avg_losses['entropy']:.4f} (per-sample confidence)")
+            print(f"  Diversity: {avg_losses['diversity']:.4f} (cluster usage diversity)")
             print(f"  Magnitude: {avg_losses['magnitude']:.4f}")
 
             # Update learning rate scheduler
