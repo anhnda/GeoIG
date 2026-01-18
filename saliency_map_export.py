@@ -4,6 +4,9 @@ Saliency Map Export Script for ImageNet-1k using Integrated Gradients
 This script generates Integrated Gradients (IG) saliency maps for ResNet50 on ImageNet-1k.
 It samples ~100 images per class (1000 classes total) and stores the results in a structured format.
 
+IMPORTANT: Only saliency maps from CORRECT predictions are saved. This ensures that the
+learned patterns correspond to genuine class-specific activations rather than misclassification artifacts.
+
 Usage:
     python saliency_map_export.py --images_per_class 100
     python saliency_map_export.py --force_resample
@@ -14,7 +17,6 @@ import torch
 import torch.nn.functional as F
 import torchvision.models as models
 from torchvision import transforms
-from torch.utils.data import DataLoader
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -204,7 +206,7 @@ class ImageNet1kSaliencyDataset:
         for parquet_file in tqdm(train_parquet_files, desc="Reading parquet files"):
             df = pd.read_parquet(parquet_file)
 
-            for idx, row in df.iterrows():
+            for _, row in df.iterrows():
                 label = row['label']
 
                 if len(class_samples[label]) < self.images_per_class:
@@ -311,7 +313,7 @@ class SaliencyMapGenerator:
         print(f"✓ Model loaded and ready!")
 
     def generate_all_saliency_maps(self, save_frequency=100):
-        """Generate IG saliency maps for all images in the dataset."""
+        """Generate IG saliency maps for all images in the dataset (only correct predictions)."""
         print(f"\n{'='*80}")
         print(f"Generating Integrated Gradients Saliency Maps")
         print(f"{'='*80}")
@@ -319,9 +321,15 @@ class SaliencyMapGenerator:
         print(f"IG steps: {self.ig_steps}")
         print(f"Batch size: {self.batch_size}")
         print(f"Output directory: {self.output_dir}")
+        print(f"Filter: ONLY CORRECT PREDICTIONS")
 
         # Storage for saliency maps
         saliency_data = []
+
+        # Tracking statistics
+        total_processed = 0
+        correct_count = 0
+        incorrect_count = 0
 
         # Process images
         for idx in tqdm(range(len(self.dataset)), desc="Generating saliency maps"):
@@ -332,6 +340,16 @@ class SaliencyMapGenerator:
 
             # Get model prediction
             pred_class, confidence = self.ig.predict(image_tensor)
+
+            total_processed += 1
+            is_correct = (true_label == pred_class)
+
+            # ONLY process correct predictions
+            if not is_correct:
+                incorrect_count += 1
+                continue
+
+            correct_count += 1
 
             # Compute IG saliency map (using predicted class)
             with torch.enable_grad():
@@ -345,25 +363,30 @@ class SaliencyMapGenerator:
             # Convert to numpy
             saliency_np = saliency_map.squeeze(0).cpu().numpy()  # [224, 224]
 
-            # Store metadata
+            # Store metadata (only correct predictions)
             saliency_data.append({
                 'index': idx,
                 'true_label': true_label,
                 'pred_label': pred_class,
                 'confidence': confidence,
                 'saliency_map': saliency_np,
-                'correct': (true_label == pred_class)
+                'correct': True  # Always true since we filter
             })
 
             # Periodically save to disk to avoid memory overflow
-            if (idx + 1) % save_frequency == 0 or (idx + 1) == len(self.dataset):
-                self._save_batch(saliency_data, start_idx=idx - len(saliency_data) + 1)
-                saliency_data = []  # Clear memory
+            if len(saliency_data) >= save_frequency or (idx + 1) == len(self.dataset):
+                if len(saliency_data) > 0:
+                    self._save_batch(saliency_data, start_idx=correct_count - len(saliency_data))
+                    saliency_data = []  # Clear memory
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         print(f"\n✓ All saliency maps generated and saved!")
+        print(f"  Total processed: {total_processed}")
+        print(f"  Correct predictions saved: {correct_count}")
+        print(f"  Incorrect predictions skipped: {incorrect_count}")
+        print(f"  Accuracy: {correct_count / total_processed * 100:.2f}%")
 
         # Create final metadata file
         self._create_metadata()
@@ -414,7 +437,9 @@ class SaliencyMapGenerator:
             'class_counts': dict(class_counts),
             'class_correct': dict(class_correct),
             'saliency_map_shape': (224, 224),
-            'num_batches': len(batch_files)
+            'num_batches': len(batch_files),
+            'filter_correct_only': True,  # Only correct predictions are saved
+            'note': 'All samples are from correct predictions only'
         }
 
         # Save metadata
@@ -425,9 +450,10 @@ class SaliencyMapGenerator:
         print(f"\n{'='*80}")
         print(f"Saliency Map Generation Summary")
         print(f"{'='*80}")
-        print(f"Total samples: {total_samples}")
-        print(f"Model accuracy: {accuracy * 100:.2f}%")
+        print(f"Total samples saved: {total_samples} (CORRECT predictions only)")
+        print(f"Accuracy of saved samples: {accuracy * 100:.2f}% (should be 100%)")
         print(f"Correct predictions: {correct_predictions}/{total_samples}")
+        print(f"Classes with samples: {len(class_counts)}")
         print(f"Output directory: {self.output_dir}")
         print(f"Number of batches: {len(batch_files)}")
 
@@ -443,7 +469,10 @@ class SaliencyMapGenerator:
 # ==========================================
 
 class SaliencyMapLoader:
-    """Utility class to load saved saliency maps efficiently."""
+    """Utility class to load saved saliency maps efficiently.
+
+    NOTE: All loaded saliency maps are from CORRECT predictions only.
+    """
 
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
@@ -453,7 +482,7 @@ class SaliencyMapLoader:
         # Load metadata
         if self.metadata_path.exists():
             self.metadata = joblib.load(self.metadata_path)
-            print(f"Loaded metadata: {self.metadata['total_samples']} samples")
+            print(f"Loaded metadata: {self.metadata['total_samples']} samples (CORRECT predictions only)")
         else:
             raise FileNotFoundError(f"Metadata not found: {self.metadata_path}")
 
