@@ -556,8 +556,7 @@ class LDDMMTrainer:
 
         # Learning rate scheduler (reduce on plateau)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
-        )
+            self.optimizer, mode='min', factor=0.5, patience=5)
 
         # Loss
         self.criterion = LDDMMLoss(lambda_smooth=1.0, lambda_entropy=0.1, lambda_magnitude=0.1).to(device)
