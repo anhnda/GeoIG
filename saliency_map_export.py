@@ -363,17 +363,15 @@ class SaliencyMapGenerator:
             # Convert to numpy
             saliency_np = saliency_map.squeeze(0).cpu().numpy()  # [224, 224]
 
-            # Also save the original image (denormalized for visualization)
-            image_np = image_tensor.squeeze(0).cpu().numpy()  # [3, 224, 224]
-
             # Store metadata (only correct predictions)
+            # NOTE: Store sample_index instead of full image to reduce file size
             saliency_data.append({
                 'index': idx,
+                'sample_index': idx,  # Index to reload original image from dataset
                 'true_label': true_label,
                 'pred_label': pred_class,
                 'confidence': confidence,
                 'saliency_map': saliency_np,
-                'original_image': image_np,  # Normalized image tensor
                 'correct': True  # Always true since we filter
             })
 

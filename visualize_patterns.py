@@ -32,12 +32,13 @@ import sys
 sys.path.append('.')
 from geo_patterns import LDDMM_GlobalPatternPipeline
 from full_classes import IMAGENET2012_CLASSES
+from saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
 
 
 class PatternVisualizer:
     """Visualize learned patterns and decompositions."""
 
-    def __init__(self, checkpoint_path, data_dir, device='cuda', imagenet_dir=None):
+    def __init__(self, checkpoint_path, data_dir, device='cuda', imagenet_dir=None, images_per_class=100):
         self.device = device
         self.data_dir = Path(data_dir)
         self.imagenet_dir = Path(imagenet_dir) if imagenet_dir else None
@@ -46,12 +47,28 @@ class PatternVisualizer:
         self.mean = np.array([0.485, 0.456, 0.406])
         self.std = np.array([0.229, 0.224, 0.225])
 
-        # Transform for loading ImageNet images
+        # Transform for loading ImageNet images (no normalization - just resize)
         self.image_transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
             transforms.ToTensor(),
         ])
+
+        # Load ImageNet dataset for accessing original images
+        print(f"\nLoading ImageNet dataset for original images...")
+        try:
+            self.imagenet_dataset = ImageNet1kSaliencyDataset(
+                raw_dir=IMAGENET_RAW_DIR,
+                sampled_dir=IMAGENET_SAMPLED_DIR,
+                output_dir=self.data_dir,
+                images_per_class=images_per_class,
+                force_resample=False
+            )
+            print(f"✓ ImageNet dataset loaded with {len(self.imagenet_dataset)} images")
+        except Exception as e:
+            print(f"Warning: Could not load ImageNet dataset: {e}")
+            print(f"Original images will not be available for visualization")
+            self.imagenet_dataset = None
 
         # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -134,6 +151,10 @@ class PatternVisualizer:
                 if 'original_image' in item:
                     data_dict['original_image'] = item['original_image']
 
+                # Store sample index if available for loading from ImageNet dataset
+                if 'sample_index' in item:
+                    data_dict['sample_index'] = item['sample_index']
+
                 # Store image path if available for loading from ImageNet
                 if 'image_path' in item:
                     data_dict['image_path'] = item['image_path']
@@ -144,7 +165,7 @@ class PatternVisualizer:
 
     def get_original_image(self, sample):
         """
-        Get original image from sample - either from stored data or load from ImageNet.
+        Get original image from sample - either from stored data or load from ImageNet dataset.
 
         Args:
             sample: Sample dictionary
@@ -152,18 +173,31 @@ class PatternVisualizer:
         Returns:
             (H, W, 3) RGB image in [0, 1] range, or None if not available
         """
-        # Method 1: Image already stored in normalized format
+        # Method 1: Image already stored in normalized format (backward compatibility)
         if 'original_image' in sample:
             return self.denormalize_image(sample['original_image'])
 
-        # Method 2: Load from ImageNet directory using image_path
+        # Method 2: Load from ImageNet dataset using sample_index
+        if 'sample_index' in sample and self.imagenet_dataset is not None:
+            try:
+                sample_idx = sample['sample_index']
+                image_pil, _ = self.imagenet_dataset[sample_idx]
+                # Transform to tensor and convert to numpy array
+                img_tensor = self.image_transform(image_pil).numpy()
+                # Convert from CHW to HWC and ensure [0, 1] range
+                img_array = img_tensor.transpose(1, 2, 0)
+                return img_array
+            except Exception as e:
+                print(f"Warning: Could not load image from dataset index {sample.get('sample_index')}: {e}")
+
+        # Method 3: Load from ImageNet directory using image_path (fallback)
         if 'image_path' in sample and self.imagenet_dir:
             try:
                 img_path = self.imagenet_dir / sample['image_path']
                 if img_path.exists():
                     img = Image.open(img_path).convert('RGB')
                     img_tensor = self.image_transform(img).numpy()
-                    return self.denormalize_image(img_tensor)
+                    return img_tensor.transpose(1, 2, 0)
             except Exception as e:
                 print(f"Warning: Could not load image from {sample.get('image_path')}: {e}")
 
@@ -497,6 +531,8 @@ def main():
                        help='Device to use (cuda/cpu)')
     parser.add_argument('--imagenet_dir', type=str, default=None,
                        help='Path to ImageNet directory (to load original images if not in saliency data)')
+    parser.add_argument('--images_per_class', type=int, default=100,
+                       help='Number of images per class (must match saliency generation)')
 
     args = parser.parse_args()
 
@@ -513,7 +549,8 @@ def main():
         checkpoint_path=args.checkpoint,
         data_dir=args.data_dir,
         device=args.device,
-        imagenet_dir=args.imagenet_dir
+        imagenet_dir=args.imagenet_dir,
+        images_per_class=args.images_per_class
     )
 
     # Visualize class patterns
