@@ -460,10 +460,10 @@ class LDDMMLoss(nn.Module):
 # ==========================================
 
 class SaliencyMapDataset(Dataset):
-    """Dataset for loading pre-computed saliency maps with lazy loading.
+    """Dataset with FULL in-memory loading for maximum speed.
 
-    This version uses lazy loading to avoid loading all data into CPU memory at once.
-    Instead, it builds an index and loads batches on-demand.
+    Loads ALL data into memory at startup and converts to tensors ONCE.
+    No workers needed, no disk I/O after startup.
     """
 
     def __init__(self, data_dir, max_samples_per_class=None):
@@ -477,68 +477,43 @@ class SaliencyMapDataset(Dataset):
 
         self.metadata = joblib.load(metadata_path)
 
-        # Index batch files (don't load data yet)
-        self.batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
-        print(f"Indexing {len(self.batch_files)} batch files...")
+        # Load ALL batches into memory
+        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
+        print(f"Loading ALL {len(batch_files)} batch files into memory...")
+        print(f"This will take ~30 seconds but makes training MUCH faster...")
 
-        # Build index: (batch_file_idx, item_idx_in_batch) -> label
-        self.sample_index = []
+        all_saliency_maps = []
+        all_labels = []
         class_counts = defaultdict(int)
 
-        for batch_idx, batch_file in enumerate(tqdm(self.batch_files, desc="Indexing batches")):
+        for batch_file in tqdm(batch_files, desc="Loading all data"):
             batch_data = joblib.load(batch_file)
 
-            for item_idx, item in enumerate(batch_data):
+            for item in batch_data:
                 label = item['true_label']
 
                 # Limit samples per class if specified
                 if max_samples_per_class is None or class_counts[label] < max_samples_per_class:
-                    self.sample_index.append({
-                        'batch_idx': batch_idx,
-                        'item_idx': item_idx,
-                        'label': label
-                    })
+                    all_saliency_maps.append(item['saliency_map'])
+                    all_labels.append(label)
                     class_counts[label] += 1
 
-        print(f"Indexed {len(self.sample_index)} samples")
-        print(f"Classes represented: {len(class_counts)}")
-        print(f"Memory footprint: ~{len(self.sample_index) * 24 / 1024 / 1024:.2f} MB (index only)")
+        # Convert to tensors ONCE (on CPU, will be moved to GPU by DataLoader)
+        print(f"Converting {len(all_saliency_maps)} samples to tensors...")
+        self.saliency_maps = torch.from_numpy(np.array(all_saliency_maps)).float().unsqueeze(1)  # (N, 1, H, W)
+        self.labels = torch.tensor(all_labels, dtype=torch.long)  # (N,)
 
-        # Cache for loaded batches (LRU cache to avoid reloading)
-        self._batch_cache = {}
-        # Keep more batches in memory since we have plenty of RAM
-        # Each batch ~100 samples × 224×224×4 bytes ≈ 20MB
-        # Cache ALL batches for maximum speed
-        self._cache_size = len(self.batch_files)  # Cache all batches
-        print(f"Batch cache size: {self._cache_size} batches (~{self._cache_size * 20} MB - FULL CACHE)")
+        memory_mb = self.saliency_maps.element_size() * self.saliency_maps.nelement() / (1024**2)
+        print(f"✓ Loaded {len(self.saliency_maps)} samples into memory ({memory_mb:.1f} MB)")
+        print(f"  Classes represented: {len(class_counts)}")
+        print(f"  Shape: {self.saliency_maps.shape}")
 
     def __len__(self):
-        return len(self.sample_index)
+        return len(self.saliency_maps)
 
     def __getitem__(self, idx):
-        index_entry = self.sample_index[idx]
-        batch_idx = index_entry['batch_idx']
-        item_idx = index_entry['item_idx']
-
-        # Load batch from cache or disk
-        if batch_idx not in self._batch_cache:
-            # Load batch from disk
-            batch_file = self.batch_files[batch_idx]
-            self._batch_cache[batch_idx] = joblib.load(batch_file)
-
-            # Only evict if over cache size (won't happen if cache_size = len(batch_files))
-            if len(self._batch_cache) > self._cache_size:
-                oldest_key = next(iter(self._batch_cache))
-                del self._batch_cache[oldest_key]
-
-        # Get item from cached batch
-        item = self._batch_cache[batch_idx][item_idx]
-
-        # Convert to tensor and add channel dimension
-        saliency = torch.from_numpy(item['saliency_map']).float().unsqueeze(0)  # (1, H, W)
-        label = torch.tensor(item['true_label'], dtype=torch.long)
-
-        return saliency, label
+        # Direct tensor indexing - INSTANT!
+        return self.saliency_maps[idx], self.labels[idx]
 
 
 # ==========================================
@@ -593,7 +568,7 @@ class LDDMMTrainer:
             labels = labels.to(self.device, non_blocking=True)
 
             # Forward pass with AMP
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
                 h_aligned, cluster_probs, phi, v_low = self.model(
                     saliency_maps, class_ids=labels, update_templates=True
                 )
@@ -774,21 +749,20 @@ def main():
         max_samples_per_class=args.max_samples_per_class
     )
 
+    # DataLoader with NO workers (data already in memory as tensors)
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True if torch.cuda.is_available() else False,
-        prefetch_factor=2 if args.num_workers > 0 else None,  # Prefetch 2 batches per worker
-        persistent_workers=True if args.num_workers > 0 else False  # Keep workers alive between epochs
+        num_workers=0,  # No workers needed - data already in memory!
+        pin_memory=True if torch.cuda.is_available() else False
     )
 
     print(f"\nDataLoader Configuration:")
     print(f"  Batch size: {args.batch_size}")
-    print(f"  Num workers: {args.num_workers}")
+    print(f"  Num workers: 0 (in-memory dataset)")
     print(f"  Pin memory: {True if torch.cuda.is_available() else False}")
-    print(f"  Prefetch factor: {2 if args.num_workers > 0 else None}")
+    print(f"  Data loading: Zero-copy tensor slicing")
 
     # Create model
     print(f"\nInitializing LDDMM model...")
