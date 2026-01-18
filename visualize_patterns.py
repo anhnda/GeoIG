@@ -39,6 +39,10 @@ class PatternVisualizer:
         self.device = device
         self.data_dir = Path(data_dir)
 
+        # ImageNet normalization parameters
+        self.mean = np.array([0.485, 0.456, 0.406])
+        self.std = np.array([0.229, 0.224, 0.225])
+
         # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -73,6 +77,26 @@ class PatternVisualizer:
         # Get class names
         self.class_names = {idx: name for idx, (wnid, name) in enumerate(IMAGENET2012_CLASSES.items())}
 
+    def denormalize_image(self, image_tensor):
+        """
+        Denormalize ImageNet-normalized image for visualization.
+
+        Args:
+            image_tensor: (3, H, W) normalized image
+
+        Returns:
+            (H, W, 3) RGB image in [0, 1] range
+        """
+        image = image_tensor.copy()
+        # Denormalize: x_orig = x_norm * std + mean
+        for i in range(3):
+            image[i] = image[i] * self.std[i] + self.mean[i]
+        # Clip to valid range
+        image = np.clip(image, 0, 1)
+        # Convert to HWC format
+        image = image.transpose(1, 2, 0)
+        return image
+
     def _load_saliency_data(self):
         """Load saliency map data."""
         saliency_dir = self.data_dir / "saliency_maps"
@@ -91,10 +115,16 @@ class PatternVisualizer:
                 if label not in self.saliency_by_class:
                     self.saliency_by_class[label] = []
 
-                self.saliency_by_class[label].append({
+                data_dict = {
                     'saliency_map': item['saliency_map'],
                     'confidence': item['confidence']
-                })
+                }
+
+                # Add original image if available (backward compatibility)
+                if 'original_image' in item:
+                    data_dict['original_image'] = item['original_image']
+
+                self.saliency_by_class[label].append(data_dict)
 
         print(f"✓ Loaded saliency maps for {len(self.saliency_by_class)} classes")
 
@@ -175,6 +205,7 @@ class PatternVisualizer:
         sample = samples[sample_idx]
         saliency_map = sample['saliency_map']
         confidence = sample['confidence']
+        has_original_image = 'original_image' in sample
 
         # Convert to tensor
         h_i = torch.from_numpy(saliency_map).float().unsqueeze(0).unsqueeze(0).to(self.device)  # (1, 1, H, W)
@@ -193,29 +224,41 @@ class PatternVisualizer:
         # Get templates
         templates = self.model.templates[class_id].cpu().numpy()  # (K, 1, H, W)
 
-        # Create comprehensive visualization
-        fig = plt.figure(figsize=(20, 12))
-        gs = fig.add_gridspec(3, 5, hspace=0.3, wspace=0.3)
+        # Create comprehensive visualization with extra column for original image
+        num_cols = 6 if has_original_image else 5
+        fig = plt.figure(figsize=(4*num_cols, 12))
+        gs = fig.add_gridspec(3, num_cols, hspace=0.3, wspace=0.3)
 
         # Title
         fig.suptitle(f'Pattern Decomposition: {class_name} (Class {class_id})\n'
                     f'Sample {sample_idx} | Confidence: {confidence:.3f}',
                     fontsize=16, fontweight='bold')
 
-        # Row 1: Original, Aligned, Deformation
-        ax1 = fig.add_subplot(gs[0, 0])
+        col_offset = 0
+
+        # Row 1 Col 0: Original Image (if available)
+        if has_original_image:
+            ax0 = fig.add_subplot(gs[0, 0])
+            original_img = self.denormalize_image(sample['original_image'])
+            ax0.imshow(original_img)
+            ax0.set_title('Original Image', fontsize=12, fontweight='bold')
+            ax0.axis('off')
+            col_offset = 1
+
+        # Row 1: Original IG, Aligned, Deformation
+        ax1 = fig.add_subplot(gs[0, col_offset])
         im1 = ax1.imshow(h_i_np, cmap='hot', interpolation='bilinear')
         ax1.set_title('Original IG Map', fontsize=12, fontweight='bold')
         ax1.axis('off')
         plt.colorbar(im1, ax=ax1, fraction=0.046)
 
-        ax2 = fig.add_subplot(gs[0, 1])
+        ax2 = fig.add_subplot(gs[0, col_offset+1])
         im2 = ax2.imshow(h_aligned_np, cmap='hot', interpolation='bilinear')
         ax2.set_title('Aligned IG Map', fontsize=12, fontweight='bold')
         ax2.axis('off')
         plt.colorbar(im2, ax=ax2, fraction=0.046)
 
-        ax3 = fig.add_subplot(gs[0, 2])
+        ax3 = fig.add_subplot(gs[0, col_offset+2])
         # Visualize deformation field magnitude
         deform_mag = np.sqrt(phi_np[0]**2 + phi_np[1]**2)
         im3 = ax3.imshow(deform_mag, cmap='viridis', interpolation='bilinear')
@@ -224,7 +267,7 @@ class PatternVisualizer:
         plt.colorbar(im3, ax=ax3, fraction=0.046)
 
         # Deformation field arrows (downsampled)
-        ax4 = fig.add_subplot(gs[0, 3:5])
+        ax4 = fig.add_subplot(gs[0, col_offset+3:col_offset+5])
         ax4.imshow(h_i_np, cmap='gray', alpha=0.3, interpolation='bilinear')
 
         # Downsample for arrow visualization
@@ -317,7 +360,11 @@ class PatternVisualizer:
         samples = self.saliency_by_class[class_id]
         num_samples = min(num_samples, len(samples))
 
-        fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4*num_samples))
+        # Check if original images are available
+        has_original_images = 'original_image' in samples[0]
+        num_cols = 5 if has_original_images else 4
+
+        fig, axes = plt.subplots(num_samples, num_cols, figsize=(4*num_cols, 4*num_samples))
         if num_samples == 1:
             axes = axes.reshape(1, -1)
 
@@ -336,30 +383,43 @@ class PatternVisualizer:
                 h_aligned, cluster_probs, _, _ = self.model(h_i, update_templates=False)
                 cluster_assigned = torch.argmax(cluster_probs, dim=-1).item()
 
+            col = 0
+
+            # Original Image (if available)
+            if has_original_images:
+                original_img = self.denormalize_image(sample['original_image'])
+                axes[i, col].imshow(original_img)
+                axes[i, col].set_title(f'Sample {i}: Original', fontsize=10)
+                axes[i, col].axis('off')
+                col += 1
+
             # Original IG
-            axes[i, 0].imshow(saliency_map, cmap='hot', interpolation='bilinear')
-            axes[i, 0].set_title(f'Sample {i}: Original IG', fontsize=10)
-            axes[i, 0].axis('off')
+            axes[i, col].imshow(saliency_map, cmap='hot', interpolation='bilinear')
+            axes[i, col].set_title(f'Original IG', fontsize=10)
+            axes[i, col].axis('off')
+            col += 1
 
             # Aligned IG
-            axes[i, 1].imshow(h_aligned.squeeze().cpu().numpy(), cmap='hot', interpolation='bilinear')
-            axes[i, 1].set_title(f'Aligned (→ Pattern {cluster_assigned})', fontsize=10)
-            axes[i, 1].axis('off')
+            axes[i, col].imshow(h_aligned.squeeze().cpu().numpy(), cmap='hot', interpolation='bilinear')
+            axes[i, col].set_title(f'Aligned (→ Pattern {cluster_assigned})', fontsize=10)
+            axes[i, col].axis('off')
+            col += 1
 
             # Assigned pattern
             template = self.model.templates[class_id, cluster_assigned].squeeze().cpu().numpy()
-            axes[i, 2].imshow(template, cmap='hot', interpolation='bilinear')
-            axes[i, 2].set_title(f'Pattern {cluster_assigned} Template', fontsize=10)
-            axes[i, 2].axis('off')
+            axes[i, col].imshow(template, cmap='hot', interpolation='bilinear')
+            axes[i, col].set_title(f'Pattern {cluster_assigned} Template', fontsize=10)
+            axes[i, col].axis('off')
+            col += 1
 
             # Cluster probabilities
             cluster_probs_np = cluster_probs.squeeze().cpu().numpy()
-            axes[i, 3].bar(range(self.k_subpatterns), cluster_probs_np,
+            axes[i, col].bar(range(self.k_subpatterns), cluster_probs_np,
                           color=['red' if k == cluster_assigned else 'blue'
                                 for k in range(self.k_subpatterns)])
-            axes[i, 3].set_title(f'Assignment Probs', fontsize=10)
-            axes[i, 3].set_ylim(0, 1)
-            axes[i, 3].grid(axis='y', alpha=0.3)
+            axes[i, col].set_title(f'Assignment Probs', fontsize=10)
+            axes[i, col].set_ylim(0, 1)
+            axes[i, col].grid(axis='y', alpha=0.3)
 
         plt.tight_layout()
 
