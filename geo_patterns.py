@@ -526,13 +526,15 @@ class LDDMMLoss(nn.Module):
         loss_entropy = self.entropy_loss(cluster_probs)  # Per-sample confidence
         loss_diversity = self.diversity_loss(cluster_probs)  # Batch-level diversity
         loss_magnitude = self.magnitude_loss(v_field)
+        loss_template_div = self.template_diversity_loss(templates)  # Template differentiation
 
         total_loss = (
             loss_align +
             self.lambda_smooth * loss_smooth +
             self.lambda_entropy * loss_entropy +
             self.lambda_diversity * loss_diversity +
-            self.lambda_magnitude * loss_magnitude
+            self.lambda_magnitude * loss_magnitude +
+            self.lambda_template_diversity * loss_template_div
         )
 
         return {
@@ -541,7 +543,8 @@ class LDDMMLoss(nn.Module):
             'smoothness': loss_smooth,
             'entropy': loss_entropy,
             'diversity': loss_diversity,
-            'magnitude': loss_magnitude
+            'magnitude': loss_magnitude,
+            'template_diversity': loss_template_div
         }
 
 
@@ -632,10 +635,11 @@ class LDDMMTrainer:
 
         # Loss (REBALANCED)
         self.criterion = LDDMMLoss(
-            lambda_smooth=0.1,       # Moderate smoothness
-            lambda_entropy=2.0,      # Re-enabled! Encourage sparse assignments per sample
-            lambda_magnitude=0.0001, # DRASTICALLY reduced - was dominating
-            lambda_diversity=3.0     # Reduced - balance with entropy for sparse but diverse patterns
+            lambda_smooth=0.1,           # Moderate smoothness
+            lambda_entropy=2.0,          # Re-enabled! Encourage sparse assignments per sample
+            lambda_magnitude=0.0001,     # DRASTICALLY reduced - was dominating
+            lambda_diversity=3.0,        # Reduced - balance with entropy for sparse but diverse patterns
+            lambda_template_diversity=5.0  # NEW! Force templates to be DIFFERENT from each other
         ).to(device)
 
         # Automatic Mixed Precision
@@ -652,7 +656,8 @@ class LDDMMTrainer:
             'train_smoothness': [],
             'train_entropy': [],
             'train_diversity': [],
-            'train_magnitude': []
+            'train_magnitude': [],
+            'train_template_diversity': []
         }
 
     def train_epoch(self, epoch):
@@ -724,6 +729,7 @@ class LDDMMTrainer:
         self.history['train_entropy'].append(avg_losses['entropy'])
         self.history['train_diversity'].append(avg_losses['diversity'])
         self.history['train_magnitude'].append(avg_losses['magnitude'])
+        self.history['train_template_diversity'].append(avg_losses['template_diversity'])
 
         return avg_losses
 
@@ -745,6 +751,7 @@ class LDDMMTrainer:
             print(f"  Entropy: {avg_losses['entropy']:.4f} (per-sample confidence)")
             print(f"  Diversity: {avg_losses['diversity']:.4f} (cluster usage diversity)")
             print(f"  Magnitude: {avg_losses['magnitude']:.4f}")
+            print(f"  Template Diversity: {avg_losses['template_diversity']:.4f} (template differentiation)")
 
             # Update learning rate scheduler
             self.scheduler.step(avg_losses['total'])
@@ -822,7 +829,7 @@ def main():
                        help='Number of classes (default: 1000)')
     parser.add_argument('--k_subpatterns', type=int, default=10,
                        help='Number of sub-patterns per class (default: 10)')
-    parser.add_argument('--epochs', type=int, default=10,
+    parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs (default: 50)')
     parser.add_argument('--batch_size', type=int, default=64,
                        help='Batch size (default: 64)')
