@@ -77,17 +77,38 @@ class PatternVisualizer:
         self.num_classes = checkpoint['templates'].shape[0]
         self.k_subpatterns = checkpoint['templates'].shape[1]
 
+        # Auto-detect velocity field resolution from checkpoint
+        # Find the LAST linear layer in v_head (the output layer)
+        v_head_keys = [k for k in checkpoint['model_state_dict'].keys()
+                       if 'predictor.v_head' in k and 'weight' in k and 'Linear' not in k]
+
+        if not v_head_keys:
+            raise ValueError("Could not find velocity head in checkpoint")
+
+        # Sort to get the last layer (highest index)
+        v_head_keys.sort()
+        v_head_key = v_head_keys[-1]
+
+        v_head_weight_shape = checkpoint['model_state_dict'][v_head_key].shape
+        v_dim = v_head_weight_shape[0]  # Output dimension: 2 * v_H * v_W
+
+        # v_dim = 2 * v_res * v_res, so v_res = sqrt(v_dim / 2)
+        v_res_size = int(np.sqrt(v_dim / 2))
+        v_res = (v_res_size, v_res_size)
+
         print(f"Loaded model:")
         print(f"  Classes: {self.num_classes}")
         print(f"  Sub-patterns per class: {self.k_subpatterns}")
+        print(f"  Velocity field resolution: {v_res} (auto-detected)")
         print(f"  Epoch: {checkpoint.get('epoch', 'unknown')}")
 
-        # Create model
+        # Create model with auto-detected architecture
         self.model = LDDMM_GlobalPatternPipeline(
             num_classes=self.num_classes,
             k_subpatterns=self.k_subpatterns,
             img_res=(224, 224),
-            device=device
+            device=device,
+            v_res=v_res
         ).to(device)
 
         # Load weights

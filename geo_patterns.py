@@ -52,7 +52,7 @@ class AmortizedPredictor(nn.Module):
     Output: (cluster_logits, velocity_field)
     """
 
-    def __init__(self, k_subpatterns=10, img_res=(224, 224)):
+    def __init__(self, k_subpatterns=10, img_res=(224, 224), v_res=(112, 112)):
         super().__init__()
         self.K = k_subpatterns
         self.res = img_res
@@ -86,19 +86,24 @@ class AmortizedPredictor(nn.Module):
         )
 
         # Head 2: Velocity Field (predict at higher resolution for detailed deformations)
-        self.v_res = (56, 56)  # Medium-res velocity field for capturing object shapes
-        self.velocity_scale = 2.0  # Reduced scale for smoother, more controlled deformations
+        self.v_res = v_res  # Configurable velocity field resolution
+        self.velocity_scale = 1.5  # Scale decreases with resolution for stable deformations
+
+        # Use larger intermediate layer for high-resolution velocity fields
+        v_output_dim = 2 * self.v_res[0] * self.v_res[1]
+        v_intermediate_dim = max(1024, v_output_dim // 4)  # Scale with output size
+
         self.v_head = nn.Sequential(
-            nn.Linear(feature_dim, 512),
+            nn.Linear(feature_dim, v_intermediate_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, 2 * self.v_res[0] * self.v_res[1]),  # 2 channels (x, y flow)
+            nn.Linear(v_intermediate_dim, v_output_dim),  # 2 channels (x, y flow)
             nn.Tanh()  # Bound to [-1, 1], then scale
         )
 
         # Initialize velocity field head to predict near-zero (small deformations initially)
-        nn.init.normal_(self.v_head[-2].weight, mean=0.0, std=0.01)
-        nn.init.zeros_(self.v_head[-2].bias)
+        nn.init.normal_(self.v_head[3].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.v_head[3].bias)
 
     def forward(self, h_i):
         """
@@ -230,16 +235,17 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
     3. Template Bank: Stores K sub-patterns per class
     """
 
-    def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224), device='cuda', temperature=0.1):
+    def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224), device='cuda', temperature=0.1, v_res=(112, 112)):
         super().__init__()
         self.num_classes = num_classes
         self.K = k_subpatterns
         self.res = img_res
         self.device = device
         self.temperature = temperature  # Lower = more confident assignments
+        self.v_res = v_res  # Velocity field resolution
 
         # 1. Predictor
-        self.predictor = AmortizedPredictor(k_subpatterns=k_subpatterns, img_res=img_res)
+        self.predictor = AmortizedPredictor(k_subpatterns=k_subpatterns, img_res=img_res, v_res=v_res)
 
         # 2. Warper
         self.warper = DiffeomorphicWarper(img_res=img_res, num_steps=7)
@@ -251,7 +257,8 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         print(f"\nLDDMM Pipeline Initialized:")
         print(f"  Classes: {num_classes}")
         print(f"  Sub-patterns per class: {k_subpatterns}")
-        print(f"  Resolution: {img_res}")
+        print(f"  Image resolution: {img_res}")
+        print(f"  Velocity field resolution: {v_res}")
         print(f"  Total templates: {num_classes * k_subpatterns}")
         print(f"  Template bank size: {template_size:.1f} MB")
         print(f"  Softmax temperature: {temperature} (lower = more confident)")
@@ -769,16 +776,16 @@ class LDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
-        # Loss (REBALANCED FOR SHAPE-BASED PATTERNS)
+        # Loss (OPTIMIZED FOR HIGH-RESOLUTION DEFORMATIONS - 112x112)
         self.criterion = LDDMMLoss(
-            lambda_smooth=0.05,              # REDUCED: allow more complex deformations for shape matching
-            lambda_entropy=1.0,              # Moderate: encourage confident assignments without over-constraining
-            lambda_magnitude=0.0001,         # Very low: allow large deformations to capture object shapes
-            lambda_diversity=2.0,            # REDUCED: less pressure to use all patterns (let shapes emerge naturally)
-            lambda_template_diversity=3.0,   # REDUCED: allow some similarity between templates (shapes can vary)
-            lambda_template_sparsity=1.0,    # REDUCED: allow less sparse patterns to capture full object shapes
-            lambda_spatial_diversity=1.0,    # REDUCED: don't force templates to different locations
-            lambda_compactness=5.0           # NEW & HIGH: strongly encourage blob-like shapes instead of lines!
+            lambda_smooth=0.1,               # INCREASED: higher res needs more smoothness regularization
+            lambda_entropy=1.0,              # Moderate: encourage confident assignments
+            lambda_magnitude=0.00005,        # REDUCED: even lower for fine-grained deformations
+            lambda_diversity=2.0,            # Let shapes emerge naturally
+            lambda_template_diversity=3.0,   # Allow some similarity between templates
+            lambda_template_sparsity=0.8,    # REDUCED: allow fuller shape coverage at high res
+            lambda_spatial_diversity=0.5,    # REDUCED: don't over-constrain spatial layout
+            lambda_compactness=8.0           # INCREASED: strongly penalize elongated patterns at high res!
         ).to(device)
 
         # Automatic Mixed Precision
