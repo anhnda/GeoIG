@@ -538,10 +538,6 @@ class AdvancedLDDMMLoss(nn.Module):
         self.lambda_jacobian = lambda_jacobian
         self.lambda_coarse_smooth = lambda_coarse_smooth  # Less smoothness penalty for coarse
 
-    # Copy all loss functions from geo_patterns.py
-    # (alignment_loss, smoothness_loss, entropy_loss, etc.)
-    # For brevity, I'll include stubs here
-
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """Hard assignment alignment loss."""
         B, K = cluster_probs.shape
@@ -562,6 +558,103 @@ class AdvancedLDDMMLoss(nn.Module):
         mass_original = h_original.sum(dim=(1, 2, 3))
         mass_aligned = h_aligned.sum(dim=(1, 2, 3))
         return torch.abs(mass_aligned - mass_original).mean()
+
+    def entropy_loss(self, cluster_probs):
+        """Entropy regularization to encourage confident assignments."""
+        entropy = -(cluster_probs * torch.log(cluster_probs + 1e-10)).sum(dim=1)
+        return entropy.mean()
+
+    def diversity_loss(self, cluster_probs):
+        """Diversity loss to encourage using all K patterns."""
+        avg_cluster_usage = cluster_probs.mean(dim=0)
+        cluster_entropy = -(avg_cluster_usage * torch.log(avg_cluster_usage + 1e-10)).sum()
+        max_entropy = np.log(cluster_probs.shape[1])
+        return max_entropy - cluster_entropy
+
+    def magnitude_loss(self, v_field):
+        """L2 penalty on velocity field magnitude."""
+        magnitude = (v_field ** 2).mean()
+        return magnitude
+
+    def jacobian_determinant_loss(self, v_field):
+        """Penalize extreme local volume changes."""
+        dphi_x_dx = v_field[:, 0:1, :, 1:] - v_field[:, 0:1, :, :-1]
+        dphi_x_dy = v_field[:, 0:1, 1:, :] - v_field[:, 0:1, :-1, :]
+        dphi_y_dx = v_field[:, 1:2, :, 1:] - v_field[:, 1:2, :, :-1]
+        dphi_y_dy = v_field[:, 1:2, 1:, :] - v_field[:, 1:2, :-1, :]
+
+        min_h = min(dphi_x_dx.shape[2], dphi_x_dy.shape[2], dphi_y_dx.shape[2], dphi_y_dy.shape[2])
+        min_w = min(dphi_x_dx.shape[3], dphi_x_dy.shape[3], dphi_y_dx.shape[3], dphi_y_dy.shape[3])
+
+        dphi_x_dx = dphi_x_dx[:, :, :min_h, :min_w]
+        dphi_x_dy = dphi_x_dy[:, :, :min_h, :min_w]
+        dphi_y_dx = dphi_y_dx[:, :, :min_h, :min_w]
+        dphi_y_dy = dphi_y_dy[:, :, :min_h, :min_w]
+
+        det_J = (1 + dphi_x_dx) * (1 + dphi_y_dy) - dphi_x_dy * dphi_y_dx
+        jac_loss = ((det_J - 1) ** 2).mean()
+        return jac_loss
+
+    def template_diversity_loss(self, templates):
+        """Penalize templates for being too similar."""
+        B, K = templates.shape[0], templates.shape[1]
+        templates_flat = templates.reshape(B, K, -1)
+        templates_norm = F.normalize(templates_flat, p=2, dim=-1)
+        similarity_matrix = torch.bmm(templates_norm, templates_norm.transpose(1, 2))
+        mask = torch.eye(K, device=templates.device).unsqueeze(0).expand(B, -1, -1)
+        similarity_matrix = similarity_matrix * (1 - mask)
+        avg_similarity = torch.abs(similarity_matrix).sum() / (B * K * (K - 1))
+        return avg_similarity
+
+    def template_sparsity_loss(self, templates):
+        """Encourage templates to be sparse."""
+        avg_intensity = torch.abs(templates).mean()
+        return avg_intensity
+
+    def spatial_center_diversity_loss(self, templates):
+        """Encourage templates to have different spatial centers."""
+        B, K, _, H, W = templates.shape
+        y_coords = torch.arange(H, device=templates.device, dtype=torch.float32).view(1, 1, 1, H, 1)
+        x_coords = torch.arange(W, device=templates.device, dtype=torch.float32).view(1, 1, 1, 1, W)
+        templates_norm = templates / (templates.sum(dim=(2, 3, 4), keepdim=True) + 1e-8)
+        center_y = (templates_norm * y_coords).sum(dim=(2, 3, 4))
+        center_x = (templates_norm * x_coords).sum(dim=(2, 3, 4))
+        centers = torch.stack([center_y, center_x], dim=-1)
+        centers_expanded1 = centers.unsqueeze(2)
+        centers_expanded2 = centers.unsqueeze(1)
+        pairwise_distances = torch.norm(centers_expanded1 - centers_expanded2, dim=-1)
+        mask = torch.eye(K, device=templates.device).unsqueeze(0).expand(B, -1, -1)
+        pairwise_distances = pairwise_distances * (1 - mask)
+        avg_distance = pairwise_distances.sum() / (B * K * (K - 1))
+        max_distance = np.sqrt(H**2 + W**2)
+        return max_distance - avg_distance
+
+    def shape_compactness_loss(self, templates):
+        """Encourage compact blob-like shapes."""
+        B, K, _, H, W = templates.shape
+        y_coords = torch.arange(H, device=templates.device, dtype=torch.float32).view(1, 1, 1, H, 1) - H/2
+        x_coords = torch.arange(W, device=templates.device, dtype=torch.float32).view(1, 1, 1, 1, W) - W/2
+        templates_norm = templates / (templates.sum(dim=(2, 3, 4), keepdim=True) + 1e-8)
+        var_y = (templates_norm * y_coords**2).sum(dim=(2, 3, 4))
+        var_x = (templates_norm * x_coords**2).sum(dim=(2, 3, 4))
+        ratio = torch.maximum(var_y, var_x) / (torch.minimum(var_y, var_x) + 1e-6)
+        compactness_penalty = torch.log(ratio + 1.0).mean()
+        return compactness_penalty
+
+    def sparsity_matching_loss(self, h_original, h_aligned):
+        """Preserve sparsity pattern."""
+        threshold = 0.01
+        sparsity_original = (h_original > threshold).float().mean(dim=(1, 2, 3))
+        sparsity_aligned = (h_aligned > threshold).float().mean(dim=(1, 2, 3))
+        sparsity_diff = torch.abs(sparsity_aligned - sparsity_original).mean()
+        return sparsity_diff
+
+    def total_variation_loss(self, templates):
+        """Reduce fragmentation in templates."""
+        diff_h = torch.abs(templates[:, :, :, 1:, :] - templates[:, :, :, :-1, :])
+        diff_w = torch.abs(templates[:, :, :, :, 1:] - templates[:, :, :, :, :-1])
+        tv = diff_h.mean() + diff_w.mean()
+        return tv
 
     def forward(self, h_original, h_aligned, templates, cluster_probs,
                 v_coarse, v_fine):
@@ -584,16 +677,37 @@ class AdvancedLDDMMLoss(nn.Module):
         # Separate smoothness for coarse (allow rougher) and fine (penalize more)
         loss_smooth_coarse = self.smoothness_loss(v_coarse)
         loss_smooth_fine = self.smoothness_loss(v_fine)
-        loss_smooth = loss_smooth_coarse + loss_smooth_fine
 
+        loss_entropy = self.entropy_loss(cluster_probs)
+        loss_diversity = self.diversity_loss(cluster_probs)
+        loss_magnitude_coarse = self.magnitude_loss(v_coarse)
+        loss_magnitude_fine = self.magnitude_loss(v_fine)
+        loss_template_div = self.template_diversity_loss(templates)
+        loss_template_sparse = self.template_sparsity_loss(templates)
+        loss_spatial_div = self.spatial_center_diversity_loss(templates)
+        loss_compactness = self.shape_compactness_loss(templates)
         loss_mass_cons = self.mass_conservation_loss(h_original, h_aligned)
+        loss_sparsity_match = self.sparsity_matching_loss(h_original, h_aligned)
+        loss_tv = self.total_variation_loss(templates)
+        loss_jacobian_coarse = self.jacobian_determinant_loss(v_coarse)
+        loss_jacobian_fine = self.jacobian_determinant_loss(v_fine)
 
-        # Simplified total loss (full implementation would include all losses from geo_patterns.py)
+        # Combined total loss
         total_loss = (
             loss_align +
             self.lambda_coarse_smooth * loss_smooth_coarse +
             self.lambda_smooth * loss_smooth_fine +
-            self.lambda_mass_conservation * loss_mass_cons
+            self.lambda_entropy * loss_entropy +
+            self.lambda_diversity * loss_diversity +
+            self.lambda_magnitude * (loss_magnitude_coarse + loss_magnitude_fine) +
+            self.lambda_template_diversity * loss_template_div +
+            self.lambda_template_sparsity * loss_template_sparse +
+            self.lambda_spatial_diversity * loss_spatial_div +
+            self.lambda_compactness * loss_compactness +
+            self.lambda_mass_conservation * loss_mass_cons +
+            self.lambda_sparsity_match * loss_sparsity_match +
+            self.lambda_tv * loss_tv +
+            self.lambda_jacobian * (loss_jacobian_coarse + loss_jacobian_fine)
         )
 
         return {
@@ -601,7 +715,17 @@ class AdvancedLDDMMLoss(nn.Module):
             'alignment': loss_align,
             'smoothness_coarse': loss_smooth_coarse,
             'smoothness_fine': loss_smooth_fine,
-            'mass_conservation': loss_mass_cons
+            'entropy': loss_entropy,
+            'diversity': loss_diversity,
+            'magnitude': loss_magnitude_coarse + loss_magnitude_fine,
+            'template_diversity': loss_template_div,
+            'template_sparsity': loss_template_sparse,
+            'spatial_diversity': loss_spatial_div,
+            'compactness': loss_compactness,
+            'mass_conservation': loss_mass_cons,
+            'sparsity_match': loss_sparsity_match,
+            'total_variation': loss_tv,
+            'jacobian': loss_jacobian_coarse + loss_jacobian_fine
         }
 
 
@@ -654,37 +778,267 @@ class SaliencyMapDataset(Dataset):
 
 
 # ==========================================
+# Training
+# ==========================================
+
+class AdvancedLDDMMTrainer:
+    """Trainer for Advanced LDDMM pipeline with multi-scale features."""
+
+    def __init__(self, model, train_loader, val_loader=None,
+                 lr=1e-3, device='cuda', checkpoint_dir='./checkpoints_advanced', use_amp=True):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True)
+        self.use_amp = use_amp and torch.cuda.is_available()
+
+        # Optimizer
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
+
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5)
+
+        # Loss (rebalanced for advanced features)
+        self.criterion = AdvancedLDDMMLoss(
+            lambda_smooth=0.1,
+            lambda_entropy=1.0,
+            lambda_magnitude=0.00005,
+            lambda_diversity=2.0,
+            lambda_template_diversity=2.0,
+            lambda_template_sparsity=1.5,
+            lambda_spatial_diversity=0.3,
+            lambda_compactness=10.0,
+            lambda_mass_conservation=100.0,
+            lambda_sparsity_match=10.0,
+            lambda_tv=0.5,
+            lambda_jacobian=50.0,
+            lambda_coarse_smooth=0.05
+        ).to(device)
+
+        # Automatic Mixed Precision
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+            print(f"  Using Automatic Mixed Precision (AMP) for faster training")
+        else:
+            self.scaler = None
+
+        # History
+        self.history = defaultdict(list)
+
+    def train_epoch(self, epoch):
+        """Train for one epoch."""
+        self.model.train()
+
+        epoch_losses = defaultdict(float)
+        num_batches = 0
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+
+        for batch_idx, (saliency_maps, labels) in enumerate(pbar):
+            saliency_maps = saliency_maps.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            # Forward pass with AMP
+            with torch.amp.autocast('cuda', enabled=self.use_amp):
+                h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine = self.model(
+                    saliency_maps, class_ids=labels, update_templates=True
+                )
+
+                # Get templates for this batch
+                batch_templates = self.model.get_batch_templates(labels)
+
+                # Compute loss with multi-scale velocity fields
+                losses = self.criterion(saliency_maps, h_aligned, batch_templates,
+                                      cluster_probs, v_coarse, v_fine)
+
+            # Backward with AMP
+            self.optimizer.zero_grad()
+            if self.use_amp:
+                self.scaler.scale(losses['total']).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                losses['total'].backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+            # Accumulate losses
+            for key, value in losses.items():
+                epoch_losses[key] += value.item()
+            num_batches += 1
+
+            # Update progress bar
+            postfix_dict = {
+                'loss': losses['total'].item(),
+                'align': losses['alignment'].item(),
+            }
+            if torch.cuda.is_available():
+                gpu_mem_used = torch.cuda.memory_allocated() / (1024**3)
+                postfix_dict['GPU_GB'] = f'{gpu_mem_used:.1f}'
+            pbar.set_postfix(postfix_dict)
+
+            # Periodic GPU memory cleanup
+            if batch_idx % 100 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Average losses
+        avg_losses = {key: value / num_batches for key, value in epoch_losses.items()}
+
+        # Update history
+        for key, value in avg_losses.items():
+            self.history[f'train_{key}'].append(value)
+
+        return avg_losses
+
+    def train(self, num_epochs, save_frequency=5):
+        """Train for multiple epochs."""
+        print(f"\n{'='*80}")
+        print(f"Starting Advanced LDDMM Training")
+        print(f"{'='*80}")
+        print(f"Epochs: {num_epochs}")
+        print(f"Device: {self.device}")
+
+        for epoch in range(1, num_epochs + 1):
+            avg_losses = self.train_epoch(epoch)
+
+            print(f"\nEpoch {epoch}/{num_epochs} Summary:")
+            print(f"  Total Loss: {avg_losses['total']:.4f}")
+            print(f"  Alignment: {avg_losses['alignment']:.4f}")
+            print(f"  *** MASS CONSERVATION: {avg_losses['mass_conservation']:.4f}")
+            print(f"  *** SPARSITY MATCH: {avg_losses['sparsity_match']:.4f}")
+            print(f"  *** JACOBIAN: {avg_losses['jacobian']:.4f}")
+            print(f"  Smoothness (Coarse): {avg_losses['smoothness_coarse']:.4f}")
+            print(f"  Smoothness (Fine): {avg_losses['smoothness_fine']:.4f}")
+            print(f"  Entropy: {avg_losses['entropy']:.4f}")
+            print(f"  Diversity: {avg_losses['diversity']:.4f}")
+            print(f"  Template Diversity: {avg_losses['template_diversity']:.4f}")
+            print(f"  Template Sparsity: {avg_losses['template_sparsity']:.4f}")
+            print(f"  Compactness: {avg_losses['compactness']:.4f}")
+
+            # Update learning rate scheduler
+            self.scheduler.step(avg_losses['total'])
+
+            # Save checkpoint
+            if epoch % save_frequency == 0:
+                self.save_checkpoint(epoch)
+
+        # Final save
+        self.save_checkpoint(num_epochs, final=True)
+
+        print(f"\n{'='*80}")
+        print(f"✓ Training Complete!")
+        print(f"{'='*80}")
+
+    def save_checkpoint(self, epoch, final=False):
+        """Save model checkpoint."""
+        if final:
+            checkpoint_path = self.checkpoint_dir / "advanced_lddmm_model_final.pth"
+        else:
+            checkpoint_path = self.checkpoint_dir / f"advanced_lddmm_model_epoch_{epoch}.pth"
+
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'history': dict(self.history),
+            'templates': self.model.templates,
+            'template_counts': self.model.template_counts
+        }, checkpoint_path)
+
+        print(f"  Checkpoint saved: {checkpoint_path}")
+
+    def plot_training_curves(self, save_path='training_curves_advanced.png'):
+        """Plot training curves."""
+        fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+        axes = axes.flatten()
+
+        metrics = [
+            ('train_total', 'Total Loss'),
+            ('train_alignment', 'Alignment Loss'),
+            ('train_smoothness_coarse', 'Smoothness (Coarse)'),
+            ('train_smoothness_fine', 'Smoothness (Fine)'),
+            ('train_mass_conservation', 'Mass Conservation'),
+            ('train_sparsity_match', 'Sparsity Match'),
+            ('train_jacobian', 'Jacobian'),
+            ('train_entropy', 'Entropy'),
+            ('train_diversity', 'Diversity')
+        ]
+
+        for idx, (key, title) in enumerate(metrics):
+            if key in self.history:
+                axes[idx].plot(self.history[key])
+                axes[idx].set_title(title)
+                axes[idx].set_xlabel('Epoch')
+                axes[idx].grid(True)
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        print(f"Training curves saved to {save_path}")
+
+
+# ==========================================
 # Main Script
 # ==========================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Advanced Geodesic Pattern Learning')
-    parser.add_argument('--data_dir', type=str, default='./data/saliency_imagenet1k_resnet50_100')
-    parser.add_argument('--num_classes', type=int, default=1000)
-    parser.add_argument('--k_subpatterns', type=int, default=10)
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--use_ot', action='store_true', help='Use Optimal Transport for templates')
-    parser.add_argument('--use_edge_gating', action='store_true', help='Use edge-aware gating')
-    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_advanced')
+    parser = argparse.ArgumentParser(
+        description='Advanced Geodesic Pattern Learning with Multi-Scale LDDMM and Optimal Transport'
+    )
+    parser.add_argument('--data_dir', type=str,
+                       default='./data/saliency_imagenet1k_resnet50_100',
+                       help='Directory with saliency maps')
+    parser.add_argument('--num_classes', type=int, default=1000,
+                       help='Number of classes (default: 1000)')
+    parser.add_argument('--k_subpatterns', type=int, default=10,
+                       help='Number of sub-patterns per class (default: 10)')
+    parser.add_argument('--epochs', type=int, default=50,
+                       help='Number of training epochs (default: 50)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Batch size (default: 32)')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                       help='Learning rate (default: 1e-3)')
+    parser.add_argument('--use_ot', action='store_true',
+                       help='Use Optimal Transport for template updates')
+    parser.add_argument('--use_edge_gating', action='store_true',
+                       help='Use edge-aware attention gating')
+    parser.add_argument('--max_samples_per_class', type=int, default=None,
+                       help='Max samples per class (default: None = all)')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_advanced',
+                       help='Checkpoint directory')
 
     args = parser.parse_args()
 
+    # Setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*80}")
     print(f"Advanced Geodesic Pattern Learning")
     print(f"{'='*80}")
     print(f"Device: {device}")
-    print(f"Features:")
-    print(f"  - Multi-scale coarse-to-fine alignment")
+
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"Total GPU Memory: {total_mem:.1f} GB")
+        torch.cuda.empty_cache()
+
+    print(f"\nFeatures:")
+    print(f"  - Multi-scale coarse-to-fine alignment (14×14 → 112×112)")
     print(f"  - Optimal Transport: {args.use_ot}")
     print(f"  - Edge-aware gating: {args.use_edge_gating}")
 
     # Load dataset
-    print(f"\nLoading dataset from {args.data_dir}...")
-    dataset = SaliencyMapDataset(data_dir=args.data_dir)
+    print(f"\nLoading saliency maps from {args.data_dir}...")
+    dataset = SaliencyMapDataset(
+        data_dir=args.data_dir,
+        max_samples_per_class=args.max_samples_per_class
+    )
 
+    # DataLoader (no workers needed - data already in memory)
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -692,6 +1046,11 @@ def main():
         num_workers=0,
         pin_memory=True if torch.cuda.is_available() else False
     )
+
+    print(f"\nDataLoader Configuration:")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Num workers: 0 (in-memory dataset)")
+    print(f"  Pin memory: {True if torch.cuda.is_available() else False}")
 
     # Create model
     print(f"\nInitializing Advanced LDDMM model...")
@@ -703,12 +1062,45 @@ def main():
         temperature=0.1,
         use_ot=args.use_ot,
         use_edge_gating=args.use_edge_gating
-    ).to(device)
+    )
 
-    print("\n✓ Model initialized!")
-    print("\nNote: This is a template implementation.")
-    print("Full training loop would be implemented similar to geo_patterns.py")
-    print(f"\nTo train: python geo_x.py --use_ot --data_dir {args.data_dir}")
+    # Create trainer
+    trainer = AdvancedLDDMMTrainer(
+        model=model,
+        train_loader=train_loader,
+        lr=args.lr,
+        device=device,
+        checkpoint_dir=args.checkpoint_dir
+    )
+
+    # Print expected memory usage
+    if torch.cuda.is_available():
+        print(f"\nEstimated GPU Memory Usage:")
+        template_mem = args.num_classes * args.k_subpatterns * 1 * 224 * 224 * 4 / (1024**3)
+        batch_mem = args.batch_size * 1 * 224 * 224 * 4 / (1024**3)
+        model_mem = sum(p.numel() * 4 for p in model.parameters()) / (1024**3)
+        print(f"  Template bank: ~{template_mem:.2f} GB")
+        print(f"  Model parameters: ~{model_mem:.2f} GB")
+        print(f"  Batch data: ~{batch_mem:.2f} GB")
+        print(f"  Estimated total: ~{template_mem + model_mem + batch_mem * 3:.2f} GB")
+        print(f"  Available: {total_mem:.1f} GB")
+
+    # Train
+    trainer.train(num_epochs=args.epochs, save_frequency=5)
+
+    # Plot training curves
+    trainer.plot_training_curves(
+        save_path=Path(args.checkpoint_dir) / 'training_curves_advanced.png'
+    )
+
+    if torch.cuda.is_available():
+        print(f"\nFinal GPU Memory Usage:")
+        print(f"  Allocated: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+        print(f"  Cached: {torch.cuda.memory_reserved() / (1024**3):.2f} GB")
+
+    print(f"\n✓ All done!")
+    print(f"\nTo use the trained model:")
+    print(f"  python geo_x.py --data_dir {args.data_dir} --use_ot --epochs {args.epochs}")
 
 
 if __name__ == "__main__":
