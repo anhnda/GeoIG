@@ -256,7 +256,12 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         print(f"  Template bank size: {template_size:.1f} MB")
         print(f"  Softmax temperature: {temperature} (lower = more confident)")
 
-        self.register_buffer('templates', torch.zeros((num_classes, k_subpatterns, 1, *img_res)))
+        # Initialize templates with random sparse patterns (not zeros!)
+        # This breaks symmetry and encourages diverse templates
+        templates_init = torch.rand((num_classes, k_subpatterns, 1, *img_res)) * 0.1
+        # Make them sparse by thresholding
+        templates_init = torch.where(templates_init > 0.07, templates_init, torch.zeros_like(templates_init))
+        self.register_buffer('templates', templates_init)
         self.register_buffer('template_counts', torch.zeros(num_classes, k_subpatterns))
 
     def forward(self, h_i, class_ids=None, update_templates=True):
@@ -368,13 +373,14 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0):
+    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0):
         super().__init__()
         self.lambda_smooth = lambda_smooth  # REDUCED: allow complex deformations
         self.lambda_entropy = lambda_entropy  # INCREASED: force diverse clustering!
         self.lambda_magnitude = lambda_magnitude  # REDUCED: allow bigger deformations
         self.lambda_diversity = lambda_diversity  # NEW: encourage using all patterns
         self.lambda_template_diversity = lambda_template_diversity  # NEW: force templates to be DIFFERENT from each other!
+        self.lambda_template_sparsity = lambda_template_sparsity  # NEW: force templates to be SPARSE (not smooth blobs)
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -508,6 +514,23 @@ class LDDMMLoss(nn.Module):
 
         return avg_similarity  # Minimize this = maximize diversity
 
+    def template_sparsity_loss(self, templates):
+        """
+        Encourage templates to be SPARSE (not smooth blobs).
+
+        Penalize templates for having high average intensity - we want most pixels to be zero/low.
+        Sparse templates better match sparse saliency maps.
+
+        Args:
+            templates: (B, K, 1, H, W) - Templates for batch
+
+        Returns:
+            loss: scalar (average intensity - minimize to encourage sparsity)
+        """
+        # L1 norm encourages sparsity
+        avg_intensity = torch.abs(templates).mean()
+        return avg_intensity
+
     def forward(self, h_aligned, templates, cluster_probs, v_field):
         """
         Compute total loss.
@@ -527,6 +550,7 @@ class LDDMMLoss(nn.Module):
         loss_diversity = self.diversity_loss(cluster_probs)  # Batch-level diversity
         loss_magnitude = self.magnitude_loss(v_field)
         loss_template_div = self.template_diversity_loss(templates)  # Template differentiation
+        loss_template_sparse = self.template_sparsity_loss(templates)  # Template sparsity
 
         total_loss = (
             loss_align +
@@ -534,7 +558,8 @@ class LDDMMLoss(nn.Module):
             self.lambda_entropy * loss_entropy +
             self.lambda_diversity * loss_diversity +
             self.lambda_magnitude * loss_magnitude +
-            self.lambda_template_diversity * loss_template_div
+            self.lambda_template_diversity * loss_template_div +
+            self.lambda_template_sparsity * loss_template_sparse
         )
 
         return {
@@ -544,7 +569,8 @@ class LDDMMLoss(nn.Module):
             'entropy': loss_entropy,
             'diversity': loss_diversity,
             'magnitude': loss_magnitude,
-            'template_diversity': loss_template_div
+            'template_diversity': loss_template_div,
+            'template_sparsity': loss_template_sparse
         }
 
 
@@ -633,13 +659,14 @@ class LDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
-        # Loss (REBALANCED)
+        # Loss (REBALANCED FOR SPARSE TEMPLATES)
         self.criterion = LDDMMLoss(
-            lambda_smooth=0.1,           # Moderate smoothness
-            lambda_entropy=2.0,          # Re-enabled! Encourage sparse assignments per sample
-            lambda_magnitude=0.0001,     # DRASTICALLY reduced - was dominating
-            lambda_diversity=3.0,        # Reduced - balance with entropy for sparse but diverse patterns
-            lambda_template_diversity=5.0  # NEW! Force templates to be DIFFERENT from each other
+            lambda_smooth=0.1,              # Moderate smoothness
+            lambda_entropy=2.0,             # Re-enabled! Encourage sparse assignments per sample
+            lambda_magnitude=0.0001,        # DRASTICALLY reduced - was dominating
+            lambda_diversity=3.0,           # Reduced - balance with entropy for sparse but diverse patterns
+            lambda_template_diversity=10.0, # INCREASED! Force templates to be DIFFERENT from each other
+            lambda_template_sparsity=0.5    # NEW! Force templates to be SPARSE (not smooth blobs)
         ).to(device)
 
         # Automatic Mixed Precision
@@ -657,7 +684,8 @@ class LDDMMTrainer:
             'train_entropy': [],
             'train_diversity': [],
             'train_magnitude': [],
-            'train_template_diversity': []
+            'train_template_diversity': [],
+            'train_template_sparsity': []
         }
 
     def train_epoch(self, epoch):
@@ -730,6 +758,7 @@ class LDDMMTrainer:
         self.history['train_diversity'].append(avg_losses['diversity'])
         self.history['train_magnitude'].append(avg_losses['magnitude'])
         self.history['train_template_diversity'].append(avg_losses['template_diversity'])
+        self.history['train_template_sparsity'].append(avg_losses['template_sparsity'])
 
         return avg_losses
 
@@ -752,6 +781,7 @@ class LDDMMTrainer:
             print(f"  Diversity: {avg_losses['diversity']:.4f} (cluster usage diversity)")
             print(f"  Magnitude: {avg_losses['magnitude']:.4f}")
             print(f"  Template Diversity: {avg_losses['template_diversity']:.4f} (template differentiation)")
+            print(f"  Template Sparsity: {avg_losses['template_sparsity']:.4f} (sparsity - lower is better)")
 
             # Update learning rate scheduler
             self.scheduler.step(avg_losses['total'])

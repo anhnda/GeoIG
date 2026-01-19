@@ -23,7 +23,6 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 import joblib
-from tqdm import tqdm
 from PIL import Image
 from torchvision import transforms
 
@@ -98,8 +97,10 @@ class PatternVisualizer:
         # Templates are already in the model's buffers from state_dict
         print(f"✓ Model loaded successfully!")
 
-        # Load saliency data
-        self._load_saliency_data()
+        # Store path to saliency data (don't load into memory)
+        self.saliency_dir = self.data_dir / "saliency_maps"
+        if not self.saliency_dir.exists():
+            print(f"Warning: Saliency directory not found: {self.saliency_dir}")
 
         # Get class names
         self.class_names = {idx: name for idx, (wnid, name) in enumerate(IMAGENET2012_CLASSES.items())}
@@ -124,44 +125,46 @@ class PatternVisualizer:
         image = image.transpose(1, 2, 0)
         return image
 
-    def _load_saliency_data(self):
-        """Load saliency map data."""
-        saliency_dir = self.data_dir / "saliency_maps"
-        batch_files = sorted(saliency_dir.glob("batch_*.pkl"))
+    def sample_class_images(self, class_id, num_samples=None):
+        """
+        Sample images from a specific class on-demand without loading all data.
 
-        print(f"\nLoading saliency data from {len(batch_files)} batches...")
+        Args:
+            class_id: Class index to sample from
+            num_samples: Number of samples to retrieve (None = all available)
 
-        self.saliency_by_class = {}
+        Returns:
+            List of sample dictionaries for the class
+        """
+        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
 
-        for batch_file in tqdm(batch_files, desc="Loading saliency maps"):
+        class_samples = []
+
+        for batch_file in batch_files:
             batch_data = joblib.load(batch_file)
 
             for item in batch_data:
-                label = item['true_label']
+                if item['true_label'] == class_id:
+                    # Only store necessary data
+                    sample_dict = {
+                        'sample_index': item.get('sample_index', item.get('index')),
+                        'confidence': item['confidence'],
+                        'saliency_map': item['saliency_map']
+                    }
 
-                if label not in self.saliency_by_class:
-                    self.saliency_by_class[label] = []
+                    # Add optional fields if available
+                    if 'original_image' in item:
+                        sample_dict['original_image'] = item['original_image']
+                    if 'image_path' in item:
+                        sample_dict['image_path'] = item['image_path']
 
-                data_dict = {
-                    'saliency_map': item['saliency_map'],
-                    'confidence': item['confidence']
-                }
+                    class_samples.append(sample_dict)
 
-                # Add original image if available (backward compatibility)
-                if 'original_image' in item:
-                    data_dict['original_image'] = item['original_image']
+                    # Early exit if we have enough samples
+                    if num_samples and len(class_samples) >= num_samples:
+                        return class_samples
 
-                # Store sample index if available for loading from ImageNet dataset
-                if 'sample_index' in item:
-                    data_dict['sample_index'] = item['sample_index']
-
-                # Store image path if available for loading from ImageNet
-                if 'image_path' in item:
-                    data_dict['image_path'] = item['image_path']
-
-                self.saliency_by_class[label].append(data_dict)
-
-        print(f"✓ Loaded saliency maps for {len(self.saliency_by_class)} classes")
+        return class_samples
 
     def get_original_image(self, sample):
         """
@@ -267,15 +270,20 @@ class PatternVisualizer:
         """
         class_name = self.class_names.get(class_id, f"Class {class_id}")
 
-        # Get sample
-        if class_id not in self.saliency_by_class:
+        # Sample images on-demand (load only what we need)
+        samples = self.sample_class_images(class_id, num_samples=sample_idx + 1)
+
+        if not samples:
             print(f"Error: No samples found for class {class_id}")
             return None
 
-        samples = self.saliency_by_class[class_id]
         if sample_idx >= len(samples):
-            print(f"Error: Sample {sample_idx} not found (only {len(samples)} samples)")
-            return None
+            print(f"Error: Sample {sample_idx} not found (only {len(samples)} samples available)")
+            print(f"Loading more samples...")
+            samples = self.sample_class_images(class_id)
+            if sample_idx >= len(samples):
+                print(f"Error: Sample {sample_idx} not found (only {len(samples)} total samples)")
+                return None
 
         sample = samples[sample_idx]
         saliency_map = sample['saliency_map']
@@ -290,7 +298,7 @@ class PatternVisualizer:
 
         # Forward pass
         with torch.no_grad():
-            h_aligned, cluster_probs, phi, v_low = self.model(h_i, update_templates=False)
+            h_aligned, cluster_probs, phi, _ = self.model(h_i, update_templates=False)
             cluster_assigned = torch.argmax(cluster_probs, dim=-1).item()
 
         # Move to CPU for visualization
@@ -430,11 +438,13 @@ class PatternVisualizer:
         """
         class_name = self.class_names.get(class_id, f"Class {class_id}")
 
-        if class_id not in self.saliency_by_class:
+        # Sample images on-demand (load only what we need)
+        samples = self.sample_class_images(class_id, num_samples=num_samples)
+
+        if not samples:
             print(f"Error: No samples found for class {class_id}")
             return None
 
-        samples = self.saliency_by_class[class_id]
         num_samples = min(num_samples, len(samples))
 
         # Check if original images are available
