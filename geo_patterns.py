@@ -410,7 +410,7 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0, lambda_spatial_diversity=1.0, lambda_compactness=1.0, lambda_mass_conservation=1.0, lambda_sparsity_match=1.0, lambda_tv=1.0):
+    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0, lambda_spatial_diversity=1.0, lambda_compactness=1.0, lambda_mass_conservation=1.0, lambda_sparsity_match=1.0, lambda_tv=1.0, lambda_jacobian=1.0):
         super().__init__()
         self.lambda_smooth = lambda_smooth  # REDUCED: allow complex deformations
         self.lambda_entropy = lambda_entropy  # INCREASED: force diverse clustering!
@@ -423,6 +423,7 @@ class LDDMMLoss(nn.Module):
         self.lambda_mass_conservation = lambda_mass_conservation  # CRITICAL: prevent creating/destroying mass
         self.lambda_sparsity_match = lambda_sparsity_match  # CRITICAL: preserve sparsity pattern
         self.lambda_tv = lambda_tv  # NEW: reduce template fragmentation
+        self.lambda_jacobian = lambda_jacobian  # CRITICAL: prevent extreme spatial distortion
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -519,6 +520,54 @@ class LDDMMLoss(nn.Module):
         """
         magnitude = (v_field ** 2).mean()
         return magnitude
+
+    def jacobian_determinant_loss(self, v_field):
+        """
+        Penalize deformations that create extreme local expansion/compression.
+
+        The Jacobian determinant measures local volume change:
+        - det(J) = 1: volume preserving (ideal)
+        - det(J) > 1: local expansion (spreading content thin)
+        - det(J) < 1: local compression (concentrating content)
+
+        This prevents sparse regions from being spread over large areas.
+
+        Args:
+            v_field: (B, 2, H, W) - Velocity field
+
+        Returns:
+            loss: scalar (deviation from volume preservation)
+        """
+        # Compute spatial gradients of velocity field
+        # v_field[0] = phi_x, v_field[1] = phi_y
+
+        # ∂phi_x/∂x
+        dphi_x_dx = v_field[:, 0:1, :, 1:] - v_field[:, 0:1, :, :-1]
+        # ∂phi_x/∂y
+        dphi_x_dy = v_field[:, 0:1, 1:, :] - v_field[:, 0:1, :-1, :]
+        # ∂phi_y/∂x
+        dphi_y_dx = v_field[:, 1:2, :, 1:] - v_field[:, 1:2, :, :-1]
+        # ∂phi_y/∂y
+        dphi_y_dy = v_field[:, 1:2, 1:, :] - v_field[:, 1:2, :-1, :]
+
+        # Pad to match dimensions (we lost 1 pixel on each edge)
+        # Take the minimum size
+        min_h = min(dphi_x_dx.shape[2], dphi_x_dy.shape[2], dphi_y_dx.shape[2], dphi_y_dy.shape[2])
+        min_w = min(dphi_x_dx.shape[3], dphi_x_dy.shape[3], dphi_y_dx.shape[3], dphi_y_dy.shape[3])
+
+        dphi_x_dx = dphi_x_dx[:, :, :min_h, :min_w]
+        dphi_x_dy = dphi_x_dy[:, :, :min_h, :min_w]
+        dphi_y_dx = dphi_y_dx[:, :, :min_h, :min_w]
+        dphi_y_dy = dphi_y_dy[:, :, :min_h, :min_w]
+
+        # Jacobian determinant: det(J) = (1 + ∂phi_x/∂x)(1 + ∂phi_y/∂y) - (∂phi_x/∂y)(∂phi_y/∂x)
+        det_J = (1 + dphi_x_dx) * (1 + dphi_y_dy) - dphi_x_dy * dphi_y_dx
+
+        # Penalize deviation from 1 (volume preservation)
+        # Use L2 loss: (det_J - 1)^2
+        jac_loss = ((det_J - 1) ** 2).mean()
+
+        return jac_loss
 
     def template_diversity_loss(self, templates):
         """
@@ -749,6 +798,7 @@ class LDDMMLoss(nn.Module):
         loss_mass_cons = self.mass_conservation_loss(h_original, h_aligned)  # CRITICAL: Mass conservation
         loss_sparsity_match = self.sparsity_matching_loss(h_original, h_aligned)  # CRITICAL: Sparsity preservation
         loss_tv = self.total_variation_loss(templates)  # Template smoothness
+        loss_jacobian = self.jacobian_determinant_loss(v_field)  # CRITICAL: Volume preservation
 
         total_loss = (
             loss_align +
@@ -762,7 +812,8 @@ class LDDMMLoss(nn.Module):
             self.lambda_compactness * loss_compactness +
             self.lambda_mass_conservation * loss_mass_cons +
             self.lambda_sparsity_match * loss_sparsity_match +
-            self.lambda_tv * loss_tv
+            self.lambda_tv * loss_tv +
+            self.lambda_jacobian * loss_jacobian
         )
 
         return {
@@ -778,7 +829,8 @@ class LDDMMLoss(nn.Module):
             'compactness': loss_compactness,
             'mass_conservation': loss_mass_cons,
             'sparsity_match': loss_sparsity_match,
-            'total_variation': loss_tv
+            'total_variation': loss_tv,
+            'jacobian': loss_jacobian
         }
 
 
@@ -867,19 +919,20 @@ class LDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
-        # Loss (REBALANCED FOR MASS CONSERVATION AND SPARSITY PRESERVATION)
+        # Loss (REBALANCED FOR MASS CONSERVATION AND VOLUME PRESERVATION)
         self.criterion = LDDMMLoss(
             lambda_smooth=0.1,                    # Moderate smoothness for 112x112
             lambda_entropy=1.0,                   # Confident assignments
             lambda_magnitude=0.00005,             # Allow fine deformations
             lambda_diversity=2.0,                 # Natural pattern emergence
-            lambda_template_diversity=2.0,        # REDUCED: some overlap is ok for sparse patterns
-            lambda_template_sparsity=1.5,         # INCREASED: enforce high sparsity
-            lambda_spatial_diversity=0.3,         # REDUCED: minimal spatial constraint
-            lambda_compactness=5.0,               # REDUCED: balance with other losses
-            lambda_mass_conservation=100.0,       # CRITICAL: 10x increase - enforce perfect conservation!
-            lambda_sparsity_match=10.0,           # INCREASED: stronger sparsity preservation
-            lambda_tv=0.5                         # Moderate: reduce fragmentation without over-smoothing
+            lambda_template_diversity=2.0,        # Some overlap is ok for sparse patterns
+            lambda_template_sparsity=1.5,         # Enforce high sparsity
+            lambda_spatial_diversity=0.3,         # Minimal spatial constraint
+            lambda_compactness=10.0,              # INCREASED: strongly penalize elongated patterns
+            lambda_mass_conservation=100.0,       # CRITICAL: enforce perfect mass conservation
+            lambda_sparsity_match=10.0,           # CRITICAL: preserve sparsity patterns
+            lambda_tv=0.5,                        # Reduce fragmentation
+            lambda_jacobian=50.0                  # CRITICAL: prevent spatial spreading/compression!
         ).to(device)
 
         # Automatic Mixed Precision
@@ -903,7 +956,8 @@ class LDDMMTrainer:
             'train_compactness': [],
             'train_mass_conservation': [],
             'train_sparsity_match': [],
-            'train_total_variation': []
+            'train_total_variation': [],
+            'train_jacobian': []
         }
 
     def train_epoch(self, epoch):
@@ -982,6 +1036,7 @@ class LDDMMTrainer:
         self.history['train_mass_conservation'].append(avg_losses['mass_conservation'])
         self.history['train_sparsity_match'].append(avg_losses['sparsity_match'])
         self.history['train_total_variation'].append(avg_losses['total_variation'])
+        self.history['train_jacobian'].append(avg_losses['jacobian'])
 
         return avg_losses
 
@@ -1001,6 +1056,7 @@ class LDDMMTrainer:
             print(f"  Alignment: {avg_losses['alignment']:.4f}")
             print(f"  *** MASS CONSERVATION: {avg_losses['mass_conservation']:.4f} (CRITICAL - should be near 0!)")
             print(f"  *** SPARSITY MATCH: {avg_losses['sparsity_match']:.4f} (CRITICAL - should be near 0!)")
+            print(f"  *** JACOBIAN (Volume Preservation): {avg_losses['jacobian']:.4f} (CRITICAL - prevents spreading!)")
             print(f"  Smoothness: {avg_losses['smoothness']:.4f}")
             print(f"  Entropy: {avg_losses['entropy']:.4f} (per-sample confidence)")
             print(f"  Diversity: {avg_losses['diversity']:.4f} (cluster usage diversity)")
