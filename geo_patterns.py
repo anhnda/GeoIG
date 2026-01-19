@@ -85,9 +85,9 @@ class AmortizedPredictor(nn.Module):
             nn.Linear(256, self.K)
         )
 
-        # Head 2: Velocity Field (predict at lower resolution for smoothness)
-        self.v_res = (28, 28)  # Low-res velocity field
-        self.velocity_scale = 3.0  # Scale factor for Tanh (allows deformations up to ±3 pixels)
+        # Head 2: Velocity Field (predict at higher resolution for detailed deformations)
+        self.v_res = (56, 56)  # Medium-res velocity field for capturing object shapes
+        self.velocity_scale = 2.0  # Reduced scale for smoother, more controlled deformations
         self.v_head = nn.Sequential(
             nn.Linear(feature_dim, 512),
             nn.ReLU(),
@@ -300,7 +300,7 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         return h_aligned, cluster_probs, phi, v_low
 
     @torch.no_grad()
-    def _update_template_bank(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=90):
+    def _update_template_bank(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=75):
         """
         Update template bank using running average with SPARSITY PRESERVATION.
 
@@ -311,7 +311,7 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
             h_aligned: (B, 1, H, W) - Aligned saliency maps on GPU
             class_ids: (B,) - Class indices on GPU
             cluster_assigned: (B,) - Assigned cluster indices on GPU
-            sparsity_percentile: float - Keep only values above this percentile (default 90)
+            sparsity_percentile: float - Keep only values above this percentile (default 75 for shape preservation)
         """
         B = h_aligned.shape[0]
 
@@ -392,7 +392,7 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0, lambda_spatial_diversity=1.0):
+    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0, lambda_spatial_diversity=1.0, lambda_compactness=1.0):
         super().__init__()
         self.lambda_smooth = lambda_smooth  # REDUCED: allow complex deformations
         self.lambda_entropy = lambda_entropy  # INCREASED: force diverse clustering!
@@ -401,6 +401,7 @@ class LDDMMLoss(nn.Module):
         self.lambda_template_diversity = lambda_template_diversity  # NEW: force templates to be DIFFERENT from each other!
         self.lambda_template_sparsity = lambda_template_sparsity  # NEW: force templates to be SPARSE (not smooth blobs)
         self.lambda_spatial_diversity = lambda_spatial_diversity  # NEW: force templates to have DIFFERENT spatial centers
+        self.lambda_compactness = lambda_compactness  # NEW: encourage blob-like shapes instead of lines
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -598,6 +599,42 @@ class LDDMMLoss(nn.Module):
         max_distance = np.sqrt(H**2 + W**2)  # Maximum possible distance
         return max_distance - avg_distance  # Minimize this = maximize avg_distance
 
+    def shape_compactness_loss(self, templates):
+        """
+        Encourage templates to be COMPACT (blob-like) rather than elongated (line-like).
+
+        Measures the ratio of second moments (variance) in x and y directions.
+        For a line, this ratio is very high. For a circular blob, ratio ~1.
+
+        Args:
+            templates: (B, K, 1, H, W) - Templates for batch
+
+        Returns:
+            loss: scalar (aspect ratio penalty - minimize for compact shapes)
+        """
+        B, K, _, H, W = templates.shape
+
+        # Create coordinate grids (centered at 0)
+        y_coords = torch.arange(H, device=templates.device, dtype=torch.float32).view(1, 1, 1, H, 1) - H/2
+        x_coords = torch.arange(W, device=templates.device, dtype=torch.float32).view(1, 1, 1, 1, W) - W/2
+
+        # Normalize templates for weighted average (avoid division by zero)
+        templates_norm = templates / (templates.sum(dim=(2, 3, 4), keepdim=True) + 1e-8)
+
+        # Compute second moments (variance in x and y)
+        var_y = (templates_norm * y_coords**2).sum(dim=(2, 3, 4))  # (B, K)
+        var_x = (templates_norm * x_coords**2).sum(dim=(2, 3, 4))  # (B, K)
+
+        # Compute aspect ratio (max/min to handle both orientations)
+        # Add epsilon to avoid division by zero
+        ratio = torch.maximum(var_y, var_x) / (torch.minimum(var_y, var_x) + 1e-6)
+
+        # Penalize high aspect ratios (elongated shapes)
+        # log(ratio) grows slowly, so extreme elongations get heavily penalized
+        compactness_penalty = torch.log(ratio + 1.0).mean()
+
+        return compactness_penalty
+
     def forward(self, h_aligned, templates, cluster_probs, v_field):
         """
         Compute total loss.
@@ -619,6 +656,7 @@ class LDDMMLoss(nn.Module):
         loss_template_div = self.template_diversity_loss(templates)  # Template differentiation
         loss_template_sparse = self.template_sparsity_loss(templates)  # Template sparsity
         loss_spatial_div = self.spatial_center_diversity_loss(templates)  # Spatial diversity
+        loss_compactness = self.shape_compactness_loss(templates)  # Shape compactness
 
         total_loss = (
             loss_align +
@@ -628,7 +666,8 @@ class LDDMMLoss(nn.Module):
             self.lambda_magnitude * loss_magnitude +
             self.lambda_template_diversity * loss_template_div +
             self.lambda_template_sparsity * loss_template_sparse +
-            self.lambda_spatial_diversity * loss_spatial_div
+            self.lambda_spatial_diversity * loss_spatial_div +
+            self.lambda_compactness * loss_compactness
         )
 
         return {
@@ -640,7 +679,8 @@ class LDDMMLoss(nn.Module):
             'magnitude': loss_magnitude,
             'template_diversity': loss_template_div,
             'template_sparsity': loss_template_sparse,
-            'spatial_diversity': loss_spatial_div
+            'spatial_diversity': loss_spatial_div,
+            'compactness': loss_compactness
         }
 
 
@@ -729,15 +769,16 @@ class LDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
-        # Loss (REBALANCED FOR SPARSE TEMPLATES)
+        # Loss (REBALANCED FOR SHAPE-BASED PATTERNS)
         self.criterion = LDDMMLoss(
-            lambda_smooth=0.1,              # Moderate smoothness
-            lambda_entropy=2.0,             # Re-enabled! Encourage sparse assignments per sample
-            lambda_magnitude=0.0001,        # DRASTICALLY reduced - was dominating
-            lambda_diversity=3.0,           # Reduced - balance with entropy for sparse but diverse patterns
-            lambda_template_diversity=10.0, # INCREASED! Force templates to be DIFFERENT from each other
-            lambda_template_sparsity=2.0,   # INCREASED! Force templates to be SPARSE (not smooth blobs)
-            lambda_spatial_diversity=5.0    # NEW! Force templates to have DIFFERENT spatial centers
+            lambda_smooth=0.05,              # REDUCED: allow more complex deformations for shape matching
+            lambda_entropy=1.0,              # Moderate: encourage confident assignments without over-constraining
+            lambda_magnitude=0.0001,         # Very low: allow large deformations to capture object shapes
+            lambda_diversity=2.0,            # REDUCED: less pressure to use all patterns (let shapes emerge naturally)
+            lambda_template_diversity=3.0,   # REDUCED: allow some similarity between templates (shapes can vary)
+            lambda_template_sparsity=1.0,    # REDUCED: allow less sparse patterns to capture full object shapes
+            lambda_spatial_diversity=1.0,    # REDUCED: don't force templates to different locations
+            lambda_compactness=5.0           # NEW & HIGH: strongly encourage blob-like shapes instead of lines!
         ).to(device)
 
         # Automatic Mixed Precision
@@ -757,7 +798,8 @@ class LDDMMTrainer:
             'train_magnitude': [],
             'train_template_diversity': [],
             'train_template_sparsity': [],
-            'train_spatial_diversity': []
+            'train_spatial_diversity': [],
+            'train_compactness': []
         }
 
     def train_epoch(self, epoch):
@@ -832,6 +874,7 @@ class LDDMMTrainer:
         self.history['train_template_diversity'].append(avg_losses['template_diversity'])
         self.history['train_template_sparsity'].append(avg_losses['template_sparsity'])
         self.history['train_spatial_diversity'].append(avg_losses['spatial_diversity'])
+        self.history['train_compactness'].append(avg_losses['compactness'])
 
         return avg_losses
 
@@ -856,6 +899,7 @@ class LDDMMTrainer:
             print(f"  Template Diversity: {avg_losses['template_diversity']:.4f} (template differentiation)")
             print(f"  Template Sparsity: {avg_losses['template_sparsity']:.4f} (sparsity - lower is better)")
             print(f"  Spatial Diversity: {avg_losses['spatial_diversity']:.4f} (spatial center diversity)")
+            print(f"  Compactness: {avg_losses['compactness']:.4f} (shape compactness - lower = more blob-like)")
 
             # Update learning rate scheduler
             self.scheduler.step(avg_losses['total'])
