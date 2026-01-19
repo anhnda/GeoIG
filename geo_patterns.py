@@ -300,14 +300,18 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
         return h_aligned, cluster_probs, phi, v_low
 
     @torch.no_grad()
-    def _update_template_bank(self, h_aligned, class_ids, cluster_assigned):
+    def _update_template_bank(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=90):
         """
-        Update template bank using running average (VECTORIZED, fully on GPU).
+        Update template bank using running average with SPARSITY PRESERVATION.
+
+        Key fix: After running average, apply thresholding to keep only top percentile
+        of values. This prevents templates from becoming smooth blobs.
 
         Args:
             h_aligned: (B, 1, H, W) - Aligned saliency maps on GPU
             class_ids: (B,) - Class indices on GPU
             cluster_assigned: (B,) - Assigned cluster indices on GPU
+            sparsity_percentile: float - Keep only values above this percentile (default 90)
         """
         B = h_aligned.shape[0]
 
@@ -320,8 +324,23 @@ class LDDMM_GlobalPatternPipeline(nn.Module):
             count = self.template_counts[c, k]
             eta = 1.0 / count
 
-            # Fully GPU operation - no .item() calls!
-            self.templates[c, k] = (1 - eta) * self.templates[c, k] + eta * h_aligned[i]
+            # Standard running average
+            updated_template = (1 - eta) * self.templates[c, k] + eta * h_aligned[i]
+
+            # CRITICAL FIX: Apply sparsity-preserving thresholding
+            # Keep only top percentile of values to maintain sparsity
+            threshold = torch.quantile(updated_template.flatten(), sparsity_percentile / 100.0)
+            updated_template = torch.where(
+                updated_template >= threshold,
+                updated_template,
+                torch.zeros_like(updated_template)
+            )
+
+            # Normalize to maintain scale (optional, helps with stability)
+            if updated_template.max() > 0:
+                updated_template = updated_template / updated_template.max()
+
+            self.templates[c, k] = updated_template
 
     def get_template(self, class_id, cluster_id=None):
         """
@@ -373,7 +392,7 @@ class LDDMMLoss(nn.Module):
     3. Entropy Loss: Encourage confident cluster assignments
     """
 
-    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0):
+    def __init__(self, lambda_smooth=0.01, lambda_entropy=1.0, lambda_magnitude=0.01, lambda_diversity=1.0, lambda_template_diversity=1.0, lambda_template_sparsity=1.0, lambda_spatial_diversity=1.0):
         super().__init__()
         self.lambda_smooth = lambda_smooth  # REDUCED: allow complex deformations
         self.lambda_entropy = lambda_entropy  # INCREASED: force diverse clustering!
@@ -381,6 +400,7 @@ class LDDMMLoss(nn.Module):
         self.lambda_diversity = lambda_diversity  # NEW: encourage using all patterns
         self.lambda_template_diversity = lambda_template_diversity  # NEW: force templates to be DIFFERENT from each other!
         self.lambda_template_sparsity = lambda_template_sparsity  # NEW: force templates to be SPARSE (not smooth blobs)
+        self.lambda_spatial_diversity = lambda_spatial_diversity  # NEW: force templates to have DIFFERENT spatial centers
 
     def alignment_loss(self, h_aligned, templates, cluster_probs):
         """
@@ -531,6 +551,53 @@ class LDDMMLoss(nn.Module):
         avg_intensity = torch.abs(templates).mean()
         return avg_intensity
 
+    def spatial_center_diversity_loss(self, templates):
+        """
+        Encourage templates to have DIFFERENT spatial centers of mass.
+
+        Prevents all templates from concentrating their mass at the same location
+        (e.g., all centered blobs). We want spatial diversity in where patterns are located.
+
+        Args:
+            templates: (B, K, 1, H, W) - Templates for batch
+
+        Returns:
+            loss: scalar (negative variance of centers - minimize to maximize diversity)
+        """
+        B, K, _, H, W = templates.shape
+
+        # Compute center of mass for each template
+        # Create coordinate grids
+        y_coords = torch.arange(H, device=templates.device, dtype=torch.float32).view(1, 1, 1, H, 1)
+        x_coords = torch.arange(W, device=templates.device, dtype=torch.float32).view(1, 1, 1, 1, W)
+
+        # Normalize templates for weighted average (avoid division by zero)
+        templates_norm = templates / (templates.sum(dim=(2, 3, 4), keepdim=True) + 1e-8)
+
+        # Weighted average coordinates (center of mass)
+        center_y = (templates_norm * y_coords).sum(dim=(2, 3, 4))  # (B, K)
+        center_x = (templates_norm * x_coords).sum(dim=(2, 3, 4))  # (B, K)
+
+        # Compute pairwise distances between centers
+        # We want these distances to be LARGE (diverse spatial locations)
+        centers = torch.stack([center_y, center_x], dim=-1)  # (B, K, 2)
+
+        # Compute pairwise L2 distances: (B, K, K)
+        centers_expanded1 = centers.unsqueeze(2)  # (B, K, 1, 2)
+        centers_expanded2 = centers.unsqueeze(1)  # (B, 1, K, 2)
+        pairwise_distances = torch.norm(centers_expanded1 - centers_expanded2, dim=-1)  # (B, K, K)
+
+        # Mask out diagonal (self-distances)
+        mask = torch.eye(K, device=templates.device).unsqueeze(0).expand(B, -1, -1)
+        pairwise_distances = pairwise_distances * (1 - mask)
+
+        # Average distance (we want this LARGE, so return NEGATIVE)
+        avg_distance = pairwise_distances.sum() / (B * K * (K - 1))
+
+        # Return negative (minimize this = maximize distances = maximize spatial diversity)
+        max_distance = np.sqrt(H**2 + W**2)  # Maximum possible distance
+        return max_distance - avg_distance  # Minimize this = maximize avg_distance
+
     def forward(self, h_aligned, templates, cluster_probs, v_field):
         """
         Compute total loss.
@@ -551,6 +618,7 @@ class LDDMMLoss(nn.Module):
         loss_magnitude = self.magnitude_loss(v_field)
         loss_template_div = self.template_diversity_loss(templates)  # Template differentiation
         loss_template_sparse = self.template_sparsity_loss(templates)  # Template sparsity
+        loss_spatial_div = self.spatial_center_diversity_loss(templates)  # Spatial diversity
 
         total_loss = (
             loss_align +
@@ -559,7 +627,8 @@ class LDDMMLoss(nn.Module):
             self.lambda_diversity * loss_diversity +
             self.lambda_magnitude * loss_magnitude +
             self.lambda_template_diversity * loss_template_div +
-            self.lambda_template_sparsity * loss_template_sparse
+            self.lambda_template_sparsity * loss_template_sparse +
+            self.lambda_spatial_diversity * loss_spatial_div
         )
 
         return {
@@ -570,7 +639,8 @@ class LDDMMLoss(nn.Module):
             'diversity': loss_diversity,
             'magnitude': loss_magnitude,
             'template_diversity': loss_template_div,
-            'template_sparsity': loss_template_sparse
+            'template_sparsity': loss_template_sparse,
+            'spatial_diversity': loss_spatial_div
         }
 
 
@@ -666,7 +736,8 @@ class LDDMMTrainer:
             lambda_magnitude=0.0001,        # DRASTICALLY reduced - was dominating
             lambda_diversity=3.0,           # Reduced - balance with entropy for sparse but diverse patterns
             lambda_template_diversity=10.0, # INCREASED! Force templates to be DIFFERENT from each other
-            lambda_template_sparsity=0.5    # NEW! Force templates to be SPARSE (not smooth blobs)
+            lambda_template_sparsity=2.0,   # INCREASED! Force templates to be SPARSE (not smooth blobs)
+            lambda_spatial_diversity=5.0    # NEW! Force templates to have DIFFERENT spatial centers
         ).to(device)
 
         # Automatic Mixed Precision
@@ -685,7 +756,8 @@ class LDDMMTrainer:
             'train_diversity': [],
             'train_magnitude': [],
             'train_template_diversity': [],
-            'train_template_sparsity': []
+            'train_template_sparsity': [],
+            'train_spatial_diversity': []
         }
 
     def train_epoch(self, epoch):
@@ -759,6 +831,7 @@ class LDDMMTrainer:
         self.history['train_magnitude'].append(avg_losses['magnitude'])
         self.history['train_template_diversity'].append(avg_losses['template_diversity'])
         self.history['train_template_sparsity'].append(avg_losses['template_sparsity'])
+        self.history['train_spatial_diversity'].append(avg_losses['spatial_diversity'])
 
         return avg_losses
 
@@ -782,6 +855,7 @@ class LDDMMTrainer:
             print(f"  Magnitude: {avg_losses['magnitude']:.4f}")
             print(f"  Template Diversity: {avg_losses['template_diversity']:.4f} (template differentiation)")
             print(f"  Template Sparsity: {avg_losses['template_sparsity']:.4f} (sparsity - lower is better)")
+            print(f"  Spatial Diversity: {avg_losses['spatial_diversity']:.4f} (spatial center diversity)")
 
             # Update learning rate scheduler
             self.scheduler.step(avg_losses['total'])
