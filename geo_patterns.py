@@ -194,13 +194,14 @@ class DiffeomorphicWarper(nn.Module):
 
         return v  # (B, 2, H, W)
 
-    def warp_image(self, image, phi):
+    def warp_image(self, image, phi, preserve_mass=True):
         """
-        Warp image using diffeomorphism phi.
+        Warp image using diffeomorphism phi with optional mass conservation.
 
         Args:
             image: (B, C, H, W) - Input image
             phi: (B, 2, H, W) - Displacement field
+            preserve_mass: bool - If True, rescale to preserve total intensity
 
         Returns:
             warped: (B, C, H, W) - Warped image
@@ -217,6 +218,16 @@ class DiffeomorphicWarper(nn.Module):
             image, grid, mode='bilinear',
             padding_mode='border', align_corners=True
         )
+
+        # Enforce mass conservation via normalization
+        if preserve_mass:
+            # Compute total mass before and after
+            mass_original = image.sum(dim=(1, 2, 3), keepdim=True)  # (B, 1, 1, 1)
+            mass_warped = warped.sum(dim=(1, 2, 3), keepdim=True)   # (B, 1, 1, 1)
+
+            # Rescale to preserve mass (avoid division by zero)
+            scale_factor = mass_original / (mass_warped + 1e-10)
+            warped = warped * scale_factor
 
         return warped
 
@@ -866,8 +877,8 @@ class LDDMMTrainer:
             lambda_template_sparsity=1.5,         # INCREASED: enforce high sparsity
             lambda_spatial_diversity=0.3,         # REDUCED: minimal spatial constraint
             lambda_compactness=5.0,               # REDUCED: balance with other losses
-            lambda_mass_conservation=10.0,        # CRITICAL: highest priority - prevent mass creation!
-            lambda_sparsity_match=5.0,            # CRITICAL: preserve sparsity patterns
+            lambda_mass_conservation=100.0,       # CRITICAL: 10x increase - enforce perfect conservation!
+            lambda_sparsity_match=10.0,           # INCREASED: stronger sparsity preservation
             lambda_tv=0.5                         # Moderate: reduce fragmentation without over-smoothing
         ).to(device)
 
