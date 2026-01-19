@@ -433,12 +433,20 @@ class AdvancedLDDMM_Pipeline(nn.Module):
         return h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine
 
     @torch.no_grad()
-    def _update_template_bank_ot(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=90):
+    def _update_template_bank_ot(self, h_aligned, class_ids, cluster_assigned,
+                                  sparsity_percentile=90, top_k_percent=5):
         """
-        Update template bank using Optimal Transport (Sinkhorn barycenter).
+        Update template bank using Optimal Transport (Sinkhorn barycenter) with top-K sharpening.
 
         For each (class, cluster), collect all aligned samples and compute
-        their Wasserstein barycenter. This is more robust to noise than averaging.
+        their Wasserstein barycenter. Apply top-K sharpening to prevent blur leakage.
+
+        Args:
+            h_aligned: (B, 1, H, W) - Aligned saliency maps
+            class_ids: (B,) - Class indices
+            cluster_assigned: (B,) - Cluster indices
+            sparsity_percentile: float - Percentile threshold for sparsity (default: 90)
+            top_k_percent: float - Keep only top K% of pixels (default: 5% for high sharpness)
         """
         B = h_aligned.shape[0]
 
@@ -458,7 +466,22 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             # Compute Wasserstein barycenter
             barycenter = sinkhorn_barycenter(samples, reg=0.05, num_iter=30)
 
-            # Apply sparsity thresholding
+            # === TOP-K SHARPENING ===
+            # Keep only the top K% of pixels to prevent blur leakage
+            # This is critical for maintaining "Ostrich" structure across updates
+            num_pixels = barycenter.numel()
+            top_k = max(int(num_pixels * top_k_percent / 100.0), 1)
+
+            # Get indices of top-K values
+            barycenter_flat = barycenter.flatten()
+            top_k_values, top_k_indices = torch.topk(barycenter_flat, k=top_k)
+
+            # Create sharpened version: zero out all but top-K
+            barycenter_sharp = torch.zeros_like(barycenter_flat)
+            barycenter_sharp[top_k_indices] = top_k_values
+            barycenter = barycenter_sharp.reshape(barycenter.shape)
+
+            # Additional sparsity thresholding (belt-and-suspenders approach)
             threshold = torch.quantile(barycenter.flatten(), sparsity_percentile / 100.0)
             barycenter = torch.where(
                 barycenter >= threshold,
@@ -734,11 +757,12 @@ class AdvancedLDDMMLoss(nn.Module):
 # ==========================================
 
 class SaliencyMapDataset(Dataset):
-    """Full in-memory dataset."""
+    """Full in-memory dataset with optional RGB image loading for edge-aware gating."""
 
-    def __init__(self, data_dir, max_samples_per_class=None):
+    def __init__(self, data_dir, max_samples_per_class=None, load_images=False):
         self.data_dir = Path(data_dir)
         self.saliency_dir = self.data_dir / "saliency_maps"
+        self.load_images = load_images
 
         metadata_path = self.data_dir / "metadata.pkl"
         if not metadata_path.exists():
@@ -751,6 +775,8 @@ class SaliencyMapDataset(Dataset):
 
         all_saliency_maps = []
         all_labels = []
+        all_images = [] if load_images else None
+        all_image_paths = []
         class_counts = defaultdict(int)
 
         for batch_file in tqdm(batch_files, desc="Loading data"):
@@ -762,19 +788,56 @@ class SaliencyMapDataset(Dataset):
                 if max_samples_per_class is None or class_counts[label] < max_samples_per_class:
                     all_saliency_maps.append(item['saliency_map'])
                     all_labels.append(label)
+
+                    # Try to load RGB images if requested
+                    if load_images:
+                        # Check if image is stored in the batch data
+                        if 'image' in item:
+                            all_images.append(item['image'])
+                        elif 'rgb_image' in item:
+                            all_images.append(item['rgb_image'])
+                        # Store image path for lazy loading
+                        elif 'image_path' in item:
+                            all_image_paths.append(item['image_path'])
+                        else:
+                            # Create a dummy grayscale image from saliency map
+                            # This is a fallback - edge detection will work but won't be optimal
+                            dummy_img = np.stack([item['saliency_map']] * 3, axis=0)
+                            all_images.append(dummy_img)
+
                     class_counts[label] += 1
 
         self.saliency_maps = torch.from_numpy(np.array(all_saliency_maps)).float().unsqueeze(1)
         self.labels = torch.tensor(all_labels, dtype=torch.long)
 
+        if load_images and all_images:
+            self.images = torch.from_numpy(np.array(all_images)).float()
+            # Normalize to [0, 1] if needed
+            if self.images.max() > 1.0:
+                self.images = self.images / 255.0
+            print(f"✓ Loaded {len(self.images)} RGB images for edge-aware gating")
+        else:
+            self.images = None
+            if load_images:
+                print(f"⚠ Warning: RGB images not found in batch data. Edge gating will use fallback mode.")
+
         memory_mb = self.saliency_maps.element_size() * self.saliency_maps.nelement() / (1024**2)
+        if self.images is not None:
+            memory_mb += self.images.element_size() * self.images.nelement() / (1024**2)
         print(f"✓ Loaded {len(self.saliency_maps)} samples ({memory_mb:.1f} MB)")
 
     def __len__(self):
         return len(self.saliency_maps)
 
     def __getitem__(self, idx):
-        return self.saliency_maps[idx], self.labels[idx]
+        saliency = self.saliency_maps[idx]
+        label = self.labels[idx]
+
+        if self.images is not None:
+            image = self.images[idx]
+            return saliency, label, image
+        else:
+            return saliency, label, None
 
 
 # ==========================================
@@ -801,21 +864,25 @@ class AdvancedLDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
-        # Loss (rebalanced for advanced features)
+        # Loss (rebalanced for advanced features with emphasis on structure preservation)
+        # CRITICAL: lambda_jacobian=50.0 is HIGH on purpose!
+        # The Jacobian determinant prevents the model from "cheating" by stretching
+        # a single noisy pixel into a large blob to satisfy alignment loss.
+        # This is essential for preserving sparse structures like "Ostrich" patterns.
         self.criterion = AdvancedLDDMMLoss(
-            lambda_smooth=0.1,
-            lambda_entropy=1.0,
-            lambda_magnitude=0.00005,
-            lambda_diversity=2.0,
-            lambda_template_diversity=2.0,
-            lambda_template_sparsity=1.5,
-            lambda_spatial_diversity=0.3,
-            lambda_compactness=10.0,
-            lambda_mass_conservation=100.0,
-            lambda_sparsity_match=10.0,
-            lambda_tv=0.5,
-            lambda_jacobian=50.0,
-            lambda_coarse_smooth=0.05
+            lambda_smooth=0.1,                    # Moderate smoothness for fine fields
+            lambda_entropy=1.0,                   # Confident cluster assignments
+            lambda_magnitude=0.00005,             # Allow detailed deformations
+            lambda_diversity=2.0,                 # Use all K patterns
+            lambda_template_diversity=2.0,        # Templates should differ
+            lambda_template_sparsity=1.5,         # High sparsity enforcement
+            lambda_spatial_diversity=0.3,         # Minimal spatial constraint
+            lambda_compactness=10.0,              # STRONG: Prefer blob-like over line-like
+            lambda_mass_conservation=100.0,       # CRITICAL: Perfect mass conservation
+            lambda_sparsity_match=10.0,           # CRITICAL: Preserve sparsity patterns
+            lambda_tv=0.5,                        # Reduce fragmentation
+            lambda_jacobian=50.0,                 # CRITICAL: Prevent spatial stretching/compression!
+            lambda_coarse_smooth=0.05             # Less smoothness penalty for coarse field
         ).to(device)
 
         # Automatic Mixed Precision
@@ -837,14 +904,26 @@ class AdvancedLDDMMTrainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
 
-        for batch_idx, (saliency_maps, labels) in enumerate(pbar):
+        for batch_idx, batch_data in enumerate(pbar):
+            # Unpack batch (handles both 2-tuple and 3-tuple returns)
+            if len(batch_data) == 3:
+                saliency_maps, labels, rgb_images = batch_data
+            else:
+                saliency_maps, labels = batch_data
+                rgb_images = None
+
             saliency_maps = saliency_maps.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
+            if rgb_images is not None:
+                rgb_images = rgb_images.to(self.device, non_blocking=True)
 
             # Forward pass with AMP
             with torch.amp.autocast('cuda', enabled=self.use_amp):
                 h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine = self.model(
-                    saliency_maps, class_ids=labels, update_templates=True
+                    saliency_maps,
+                    class_ids=labels,
+                    update_templates=True,
+                    original_images=rgb_images  # Pass images for edge-aware gating
                 )
 
                 # Get templates for this batch
@@ -1035,7 +1114,8 @@ def main():
     print(f"\nLoading saliency maps from {args.data_dir}...")
     dataset = SaliencyMapDataset(
         data_dir=args.data_dir,
-        max_samples_per_class=args.max_samples_per_class
+        max_samples_per_class=args.max_samples_per_class,
+        load_images=args.use_edge_gating  # Load RGB images only if edge gating is enabled
     )
 
     # DataLoader (no workers needed - data already in memory)

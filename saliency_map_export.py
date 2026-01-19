@@ -313,7 +313,11 @@ class SaliencyMapGenerator:
         print(f"✓ Model loaded and ready!")
 
     def generate_all_saliency_maps(self, save_frequency=100):
-        """Generate IG saliency maps for all images in the dataset (only correct predictions)."""
+        """Generate IG saliency maps for all images in the dataset (only correct predictions).
+
+        NOTE: This version saves RGB images alongside saliency maps for edge-aware gating.
+        Expected storage: ~4x larger than saliency-only (due to RGB images: 3×224×224 vs 1×224×224)
+        """
         print(f"\n{'='*80}")
         print(f"Generating Integrated Gradients Saliency Maps")
         print(f"{'='*80}")
@@ -322,6 +326,7 @@ class SaliencyMapGenerator:
         print(f"Batch size: {self.batch_size}")
         print(f"Output directory: {self.output_dir}")
         print(f"Filter: ONLY CORRECT PREDICTIONS")
+        print(f"Includes: RGB images for edge-aware gating (geo_x.py)")
 
         # Storage for saliency maps
         saliency_data = []
@@ -363,8 +368,16 @@ class SaliencyMapGenerator:
             # Convert to numpy
             saliency_np = saliency_map.squeeze(0).cpu().numpy()  # [224, 224]
 
+            # Convert RGB image tensor to numpy for storage (for edge-aware gating)
+            # Denormalize the image back to [0, 1] range
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(self.device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(self.device)
+            image_denorm = image_tensor.squeeze(0) * std + mean
+            image_denorm = torch.clamp(image_denorm, 0, 1)
+            rgb_image_np = image_denorm.cpu().numpy()  # [3, 224, 224]
+
             # Store metadata (only correct predictions)
-            # NOTE: Store sample_index instead of full image to reduce file size
+            # NOTE: Now includes RGB image for edge-aware gating in geo_x.py
             saliency_data.append({
                 'index': idx,
                 'sample_index': idx,  # Index to reload original image from dataset
@@ -372,6 +385,7 @@ class SaliencyMapGenerator:
                 'pred_label': pred_class,
                 'confidence': confidence,
                 'saliency_map': saliency_np,
+                'rgb_image': rgb_image_np,  # NEW: RGB image for edge detection
                 'correct': True  # Always true since we filter
             })
 
@@ -439,9 +453,12 @@ class SaliencyMapGenerator:
             'class_counts': dict(class_counts),
             'class_correct': dict(class_correct),
             'saliency_map_shape': (224, 224),
+            'rgb_image_shape': (3, 224, 224),  # NEW: RGB images included
+            'rgb_image_format': 'float32',     # NEW: [0, 1] range, (C, H, W) format
             'num_batches': len(batch_files),
             'filter_correct_only': True,  # Only correct predictions are saved
-            'note': 'All samples are from correct predictions only'
+            'includes_rgb_images': True,  # NEW: For edge-aware gating in geo_x.py
+            'note': 'All samples are from correct predictions only. RGB images included for edge-aware gating.'
         }
 
         # Save metadata
