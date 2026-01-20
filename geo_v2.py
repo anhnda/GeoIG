@@ -355,10 +355,26 @@ class EdgeAwareGating(nn.Module):
 
         # Detect edges
         edges = self.sobel(image_gray)  # (B, 2, H, W) - gradients in x and y
+
+        # DEBUG: Check if Sobel returned valid shape
+        if edges.shape[1] != 2:
+            print(f"❌ Sobel filter returned unexpected shape: {edges.shape}, expected (B, 2, H, W)")
+            raise RuntimeError(f"Sobel output has wrong shape: {edges.shape}")
+
         edge_magnitude = torch.sqrt(edges[:, 0:1]**2 + edges[:, 1:2]**2 + 1e-8)
+
+        # DEBUG: Verify edge_magnitude has correct shape
+        if edge_magnitude.shape[1] != 1:
+            print(f"❌ edge_magnitude has wrong shape: {edge_magnitude.shape}, expected (B, 1, H, W)")
+            raise RuntimeError(f"edge_magnitude shape error: {edge_magnitude.shape}")
 
         # Normalize to [0, 1]
         edge_mask = edge_magnitude / (edge_magnitude.max(dim=2, keepdim=True)[0].max(dim=3, keepdim=True)[0] + 1e-8)
+
+        # DEBUG: Verify edge_mask has correct shape
+        if edge_mask.shape[1] != 1:
+            print(f"❌ edge_mask has wrong shape: {edge_mask.shape}, expected (B, 1, H, W)")
+            raise RuntimeError(f"edge_mask shape error: {edge_mask.shape}")
 
         # Apply soft gating (mix of uniform and edge-based)
         alpha = 0.7  # 70% edge-based, 30% uniform
@@ -366,6 +382,13 @@ class EdgeAwareGating(nn.Module):
 
         # Gate saliency
         gated_saliency = saliency * edge_mask
+
+        # CRITICAL FIX: Force 4D shape (B, 1, H, W) to prevent dimension squeezing
+        if gated_saliency.dim() == 3:
+            gated_saliency = gated_saliency.unsqueeze(1)
+
+        # Verify shape is correct
+        assert gated_saliency.shape[1] == 1, f"EdgeAwareGating: Expected 1 channel, got {gated_saliency.shape}"
 
         return gated_saliency, edge_mask
 
@@ -461,6 +484,16 @@ class AdvancedLDDMM_Pipeline(nn.Module):
         else:
             h_i_gated = h_i
             edge_mask = None
+
+        # CRITICAL FIX: Ensure h_i_gated is always (B, 1, H, W)
+        if h_i_gated.dim() == 3:
+            # Lost channel dimension - restore it
+            h_i_gated = h_i_gated.unsqueeze(1)
+            print(f"⚠️  Warning: h_i_gated was 3D, restored to 4D: {h_i_gated.shape}")
+        elif h_i_gated.shape[1] == 0:
+            # Somehow got 0 channels - use original input
+            print(f"❌ CRITICAL: h_i_gated has 0 channels {h_i_gated.shape}, falling back to h_i")
+            h_i_gated = h_i.clone()
 
         # Step 1: Predict cluster assignment and multi-scale velocity fields
         cluster_logits, v_coarse, v_fine, h_i_blurred = self.predictor(h_i_gated)
@@ -1015,6 +1048,15 @@ class SaliencyMapDataset(Dataset):
             raise
 
         # Handle different possible input shapes
+        # CRITICAL CHECK: Detect corrupted data with 0 channels
+        if 0 in saliency_np.shape:
+            print(f"\n❌❌❌ CORRUPTED DATA DETECTED at index {idx}!")
+            print(f"   Batch file: {batch_file}")
+            print(f"   Item index: {item_idx}")
+            print(f"   saliency_np.shape = {saliency_np.shape}")
+            print(f"   This data is CORRUPTED ON DISK - fix your data preprocessing!")
+            raise ValueError(f"Sample {idx}: Corrupted saliency map with 0 dimension: {saliency_np.shape}")
+
         if len(saliency_np.shape) == 2:
             # Shape is (H, W) -> add channel dimension -> (1, H, W)
             saliency = torch.from_numpy(saliency_np).float().unsqueeze(0)
@@ -1029,6 +1071,16 @@ class SaliencyMapDataset(Dataset):
                 saliency = saliency.mean(dim=0, keepdim=True)
         else:
             raise ValueError(f"Unexpected saliency map shape: {saliency_np.shape}")
+
+        # CRITICAL CHECK: Verify saliency tensor has correct shape after conversion
+        if saliency.shape[0] == 0:
+            print(f"\n❌❌❌ CRITICAL ERROR: saliency tensor has 0 channels!")
+            print(f"   Sample index: {idx}")
+            print(f"   Batch file: {batch_file}")
+            print(f"   Item index: {item_idx}")
+            print(f"   Original saliency_np.shape: {saliency_np.shape}")
+            print(f"   Converted saliency.shape: {saliency.shape}")
+            raise ValueError(f"Sample {idx}: saliency tensor has 0 channels: {saliency.shape}")
 
         # Optionally load RGB image
         if self.load_images:

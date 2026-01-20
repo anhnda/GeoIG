@@ -1,172 +1,273 @@
+#!/usr/bin/env python3
 """
-Diagnostic script to inspect saliency data batch files.
-
-This helps identify shape mismatches or corrupted data that could cause
-the [32, 0, 224, 224] tensor error.
-
-Usage:
-    python diagnose_data.py --data_dir ./data/saliency_imagenet1k_resnet50_100
+Diagnostic script to check data integrity in batch files.
 """
 
-import argparse
 import joblib
-from pathlib import Path
 import numpy as np
+import torch
+from pathlib import Path
+import argparse
+from collections import defaultdict
 
 
-def diagnose_batch_files(data_dir):
-    """Inspect batch files for shape issues."""
-    data_dir = Path(data_dir)
-    saliency_dir = data_dir / "saliency_maps"
+def diagnose_batch_file(batch_file):
+    """Diagnose a single batch file."""
+    print(f"\n{'='*80}")
+    print(f"Analyzing: {batch_file.name}")
+    print(f"{'='*80}")
 
-    if not saliency_dir.exists():
-        print(f"ERROR: Saliency directory not found: {saliency_dir}")
-        return
+    try:
+        batch_data = joblib.load(batch_file)
+        print(f"✓ Loaded successfully, contains {len(batch_data)} items")
+    except Exception as e:
+        print(f"❌ FAILED to load batch file: {e}")
+        return False
 
-    batch_files = sorted(saliency_dir.glob("batch_*.pkl"))
-    print(f"Found {len(batch_files)} batch files\n")
+    issues = []
 
-    if len(batch_files) == 0:
-        print("ERROR: No batch files found!")
-        return
+    for idx, item in enumerate(batch_data):
+        # Check keys
+        if 'saliency_map' not in item:
+            issues.append(f"Item {idx}: Missing 'saliency_map' key")
+            continue
 
-    # Check metadata
-    metadata_path = data_dir / "metadata.pkl"
-    if metadata_path.exists():
-        metadata = joblib.load(metadata_path)
-        print("="*80)
-        print("METADATA")
-        print("="*80)
-        for key, value in metadata.items():
-            if key not in ['class_counts', 'class_correct']:
-                print(f"  {key}: {value}")
-        print()
+        # Check saliency map
+        sal = item['saliency_map']
+        if not isinstance(sal, np.ndarray):
+            issues.append(f"Item {idx}: saliency_map is {type(sal)}, not ndarray")
+            continue
 
-    # Inspect first few batch files
-    issues_found = []
+        if sal.shape != (224, 224) and sal.shape != (1, 224, 224):
+            issues.append(f"Item {idx}: Invalid saliency shape {sal.shape}")
 
-    for i, batch_file in enumerate(batch_files[:5]):  # Check first 5 batches
-        print(f"{"="*80}")
-        print(f"BATCH FILE {i}: {batch_file.name}")
-        print(f"{"="*80}")
+        if np.any(np.isnan(sal)):
+            issues.append(f"Item {idx}: saliency_map contains NaN")
 
+        if np.any(np.isinf(sal)):
+            issues.append(f"Item {idx}: saliency_map contains Inf")
+
+        # Check RGB image if present
+        if 'rgb_image' in item:
+            rgb = item['rgb_image']
+            if not isinstance(rgb, np.ndarray):
+                issues.append(f"Item {idx}: rgb_image is {type(rgb)}, not ndarray")
+            elif rgb.shape not in [(3, 224, 224), (224, 224, 3)]:
+                issues.append(f"Item {idx}: Invalid RGB shape {rgb.shape}")
+            elif np.any(np.isnan(rgb)):
+                issues.append(f"Item {idx}: rgb_image contains NaN")
+            elif np.any(np.isinf(rgb)):
+                issues.append(f"Item {idx}: rgb_image contains Inf")
+
+        # Check label
+        if 'true_label' not in item:
+            issues.append(f"Item {idx}: Missing 'true_label' key")
+
+    if issues:
+        print(f"\n❌ Found {len(issues)} issues:")
+        for issue in issues[:10]:  # Show first 10
+            print(f"   {issue}")
+        if len(issues) > 10:
+            print(f"   ... and {len(issues) - 10} more issues")
+        return False
+    else:
+        print(f"✓ All {len(batch_data)} items are valid")
+        return True
+
+
+def test_dataset_loading(data_dir, load_images=True):
+    """Test the actual Dataset class loading."""
+    print(f"\n{'='*80}")
+    print(f"Testing Dataset Loading (load_images={load_images})")
+    print(f"{'='*80}")
+
+    # Import the dataset class
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from geo_v2 import SaliencyMapDataset
+
+    try:
+        dataset = SaliencyMapDataset(data_dir, load_images=load_images, cache_size=2)
+        print(f"✓ Dataset created successfully with {len(dataset)} samples")
+    except Exception as e:
+        print(f"❌ Failed to create dataset: {e}")
+        return False
+
+    # Test loading first few samples
+    print(f"\nTesting sample loading...")
+    issues = []
+
+    for idx in range(min(10, len(dataset))):
         try:
-            batch_data = joblib.load(batch_file)
-            print(f"  Items in batch: {len(batch_data)}")
+            result = dataset[idx]
 
-            if len(batch_data) == 0:
-                print(f"  ❌ WARNING: Empty batch file!")
-                issues_found.append(f"{batch_file.name}: empty batch")
-                continue
+            if load_images:
+                if len(result) != 3:
+                    issues.append(f"Sample {idx}: Expected 3 items, got {len(result)}")
+                    continue
+                saliency, label, image = result
 
-            # Check first item
-            item = batch_data[0]
-            print(f"\n  First item keys: {list(item.keys())}")
+                # Check saliency
+                if not isinstance(saliency, torch.Tensor):
+                    issues.append(f"Sample {idx}: saliency is {type(saliency)}, not Tensor")
+                elif saliency.shape != (1, 224, 224):
+                    issues.append(f"Sample {idx}: saliency shape is {saliency.shape}, expected (1, 224, 224)")
+                elif saliency.shape[0] == 0:
+                    issues.append(f"Sample {idx}: ❌ SALIENCY HAS 0 CHANNELS! Shape: {saliency.shape}")
 
-            # Check saliency map
-            if 'saliency_map' in item:
-                saliency_shape = item['saliency_map'].shape
-                saliency_dtype = item['saliency_map'].dtype
-                saliency_min = item['saliency_map'].min()
-                saliency_max = item['saliency_map'].max()
-
-                print(f"\n  Saliency Map:")
-                print(f"    Shape: {saliency_shape}")
-                print(f"    Dtype: {saliency_dtype}")
-                print(f"    Range: [{saliency_min:.4f}, {saliency_max:.4f}]")
-
-                if saliency_shape != (224, 224):
-                    print(f"    ❌ WARNING: Expected shape (224, 224), got {saliency_shape}")
-                    issues_found.append(f"{batch_file.name}: invalid saliency shape {saliency_shape}")
-                else:
-                    print(f"    ✅ Shape is correct")
-
+                # Check image
+                if image is not None:
+                    if not isinstance(image, torch.Tensor):
+                        issues.append(f"Sample {idx}: image is {type(image)}, not Tensor")
+                    elif image.shape != (3, 224, 224):
+                        issues.append(f"Sample {idx}: image shape is {image.shape}, expected (3, 224, 224)")
+                    elif image.shape[0] == 0:
+                        issues.append(f"Sample {idx}: ❌ IMAGE HAS 0 CHANNELS! Shape: {image.shape}")
             else:
-                print(f"  ❌ ERROR: No 'saliency_map' key found!")
-                issues_found.append(f"{batch_file.name}: missing saliency_map key")
+                if len(result) != 2:
+                    issues.append(f"Sample {idx}: Expected 2 items, got {len(result)}")
+                    continue
+                saliency, label = result
 
-            # Check RGB image if present
-            if 'rgb_image' in item:
-                rgb_shape = item['rgb_image'].shape
-                rgb_dtype = item['rgb_image'].dtype
-                rgb_min = item['rgb_image'].min()
-                rgb_max = item['rgb_image'].max()
-
-                print(f"\n  RGB Image:")
-                print(f"    Shape: {rgb_shape}")
-                print(f"    Dtype: {rgb_dtype}")
-                print(f"    Range: [{rgb_min:.4f}, {rgb_max:.4f}]")
-
-                if rgb_shape != (3, 224, 224):
-                    print(f"    ⚠️  WARNING: Expected shape (3, 224, 224), got {rgb_shape}")
-                    if len(rgb_shape) == 3 and 3 in rgb_shape:
-                        print(f"    ℹ️  Shape can be handled (will transpose if needed)")
-                    else:
-                        issues_found.append(f"{batch_file.name}: invalid RGB shape {rgb_shape}")
-                else:
-                    print(f"    ✅ Shape is correct")
-            else:
-                print(f"\n  ℹ️  No 'rgb_image' key (this is OK if not using edge gating)")
-
-            # Check all items for consistency
-            print(f"\n  Checking all {len(batch_data)} items...")
-            shape_issues = 0
-            missing_keys = 0
-
-            for idx, item in enumerate(batch_data):
-                if 'saliency_map' not in item:
-                    missing_keys += 1
-                    print(f"    ❌ Item {idx}: missing saliency_map")
-                else:
-                    if item['saliency_map'].shape != (224, 224):
-                        shape_issues += 1
-                        print(f"    ❌ Item {idx}: shape {item['saliency_map'].shape}")
-
-            if shape_issues > 0:
-                print(f"  ❌ Found {shape_issues} items with wrong saliency shape")
-                issues_found.append(f"{batch_file.name}: {shape_issues} items with wrong shape")
-            elif missing_keys > 0:
-                print(f"  ❌ Found {missing_keys} items with missing saliency_map")
-                issues_found.append(f"{batch_file.name}: {missing_keys} items missing key")
-            else:
-                print(f"  ✅ All items have correct shape")
+                if not isinstance(saliency, torch.Tensor):
+                    issues.append(f"Sample {idx}: saliency is {type(saliency)}, not Tensor")
+                elif saliency.shape != (1, 224, 224):
+                    issues.append(f"Sample {idx}: saliency shape is {saliency.shape}, expected (1, 224, 224)")
+                elif saliency.shape[0] == 0:
+                    issues.append(f"Sample {idx}: ❌ SALIENCY HAS 0 CHANNELS! Shape: {saliency.shape}")
 
         except Exception as e:
-            print(f"  ❌ ERROR loading batch file: {e}")
-            issues_found.append(f"{batch_file.name}: failed to load - {e}")
+            issues.append(f"Sample {idx}: Exception during loading: {e}")
 
-        print()
-
-    # Summary
-    print("="*80)
-    print("DIAGNOSIS SUMMARY")
-    print("="*80)
-
-    if len(issues_found) == 0:
-        print("✅ No issues found! Data appears to be in correct format.")
-        print("\nIf you're still getting [32, 0, 224, 224] error, the issue might be:")
-        print("  1. During DataLoader collation")
-        print("  2. In a later batch file (only first 5 were checked)")
-        print("  3. In the model's data preprocessing")
+    if issues:
+        print(f"\n❌ Found {len(issues)} issues during loading:")
+        for issue in issues:
+            print(f"   {issue}")
+        return False
     else:
-        print(f"❌ Found {len(issues_found)} issues:")
-        for issue in issues_found:
-            print(f"  - {issue}")
-
-        print("\nRECOMMENDED ACTIONS:")
-        print("  1. Re-export the saliency data using saliency_map_export.py")
-        print("  2. Check if the export process completed successfully")
-        print("  3. Verify disk space wasn't an issue during export")
-
-    print()
+        print(f"✓ All tested samples loaded correctly")
+        return True
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Diagnose saliency data batch files")
-    parser.add_argument('--data_dir', type=str,
-                       default='./data/saliency_imagenet1k_resnet50_100',
+def test_dataloader_collation(data_dir, load_images=True):
+    """Test DataLoader with collate function."""
+    print(f"\n{'='*80}")
+    print(f"Testing DataLoader Collation (load_images={load_images})")
+    print(f"{'='*80}")
+
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from geo_v2 import SaliencyMapDataset, safe_collate_fn
+    from torch.utils.data import DataLoader
+
+    try:
+        dataset = SaliencyMapDataset(data_dir, load_images=load_images, cache_size=2)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=32,
+            shuffle=False,
+            num_workers=0,  # Use 0 for debugging
+            collate_fn=safe_collate_fn
+        )
+        print(f"✓ DataLoader created successfully")
+    except Exception as e:
+        print(f"❌ Failed to create DataLoader: {e}")
+        return False
+
+    # Test first batch
+    print(f"\nTesting first batch...")
+    try:
+        batch = next(iter(dataloader))
+
+        if load_images:
+            saliency_batch, label_batch, image_batch = batch
+            print(f"✓ Batch loaded successfully:")
+            print(f"   saliency_batch.shape = {saliency_batch.shape}")
+            print(f"   label_batch.shape = {label_batch.shape}")
+            print(f"   image_batch = {image_batch.shape if image_batch is not None else None}")
+
+            # Critical check
+            if saliency_batch.shape[1] == 0:
+                print(f"\n❌❌❌ CRITICAL ERROR: saliency_batch has 0 channels!")
+                print(f"   This is the bug causing the Gaussian blur error!")
+                return False
+
+            if image_batch is not None and image_batch.shape[1] == 0:
+                print(f"\n❌❌❌ CRITICAL ERROR: image_batch has 0 channels!")
+                return False
+        else:
+            saliency_batch, label_batch = batch
+            print(f"✓ Batch loaded successfully:")
+            print(f"   saliency_batch.shape = {saliency_batch.shape}")
+            print(f"   label_batch.shape = {label_batch.shape}")
+
+            if saliency_batch.shape[1] == 0:
+                print(f"\n❌❌❌ CRITICAL ERROR: saliency_batch has 0 channels!")
+                return False
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to load batch: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Diagnose data integrity")
+    parser.add_argument('--data_dir', type=str, required=True,
                        help='Path to data directory')
+    parser.add_argument('--check_files', action='store_true',
+                       help='Check individual batch files')
+    parser.add_argument('--num_files', type=int, default=5,
+                       help='Number of batch files to check')
 
     args = parser.parse_args()
 
-    diagnose_batch_files(args.data_dir)
+    data_dir = Path(args.data_dir)
+    saliency_dir = data_dir / "saliency_maps"
+
+    if not data_dir.exists():
+        print(f"❌ Data directory not found: {data_dir}")
+        return
+
+    if not saliency_dir.exists():
+        print(f"❌ Saliency maps directory not found: {saliency_dir}")
+        return
+
+    print(f"Data directory: {data_dir}")
+    print(f"Saliency directory: {saliency_dir}")
+
+    # Check batch files
+    batch_files = sorted(saliency_dir.glob("batch_*.pkl"))
+    print(f"\nFound {len(batch_files)} batch files")
+
+    if args.check_files:
+        print(f"\nChecking first {args.num_files} batch files...")
+        all_valid = True
+        for batch_file in batch_files[:args.num_files]:
+            if not diagnose_batch_file(batch_file):
+                all_valid = False
+
+        if not all_valid:
+            print(f"\n❌ DATA IS CORRUPTED - FIX YOUR DATA FIRST!")
+            return
+
+    # Test dataset loading
+    if not test_dataset_loading(data_dir, load_images=True):
+        print(f"\n❌ DATASET LOADING FAILED - CHECK THE Dataset.__getitem__ METHOD!")
+        return
+
+    # Test dataloader
+    if not test_dataloader_collation(data_dir, load_images=True):
+        print(f"\n❌ DATALOADER COLLATION FAILED - CHECK THE COLLATE FUNCTION!")
+        return
+
+    print(f"\n{'='*80}")
+    print(f"✅ ALL CHECKS PASSED - DATA IS VALID")
+    print(f"{'='*80}")
+
+
+if __name__ == "__main__":
+    main()
