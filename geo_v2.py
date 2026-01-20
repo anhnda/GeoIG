@@ -334,8 +334,7 @@ class EdgeAwareGating(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # Sobel edge detector
-        self.sobel = kornia.filters.Sobel()
+        # No need to store Sobel as a module - we'll use functional spatial_gradient
 
     def forward(self, image, saliency):
         """
@@ -353,15 +352,16 @@ class EdgeAwareGating(nn.Module):
         else:
             image_gray = image
 
-        # Detect edges
-        edges = self.sobel(image_gray)  # (B, 2, H, W) - gradients in x and y
+        # Detect edges using spatial gradient (returns gradients in x and y)
+        # spatial_gradient returns (B, C, 2, H, W) where dim=2 is [grad_y, grad_x]
+        grads = kornia.filters.spatial_gradient(image_gray, mode='sobel')  # (B, 1, 2, H, W)
 
-        # DEBUG: Check if Sobel returned valid shape
-        if edges.shape[1] != 2:
-            print(f"❌ Sobel filter returned unexpected shape: {edges.shape}, expected (B, 2, H, W)")
-            raise RuntimeError(f"Sobel output has wrong shape: {edges.shape}")
+        # Extract x and y gradients
+        grad_y = grads[:, :, 0, :, :]  # (B, 1, H, W)
+        grad_x = grads[:, :, 1, :, :]  # (B, 1, H, W)
 
-        edge_magnitude = torch.sqrt(edges[:, 0:1]**2 + edges[:, 1:2]**2 + 1e-8)
+        # Compute edge magnitude
+        edge_magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)  # (B, 1, H, W)
 
         # DEBUG: Verify edge_magnitude has correct shape
         if edge_magnitude.shape[1] != 1:

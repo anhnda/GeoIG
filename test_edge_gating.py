@@ -22,8 +22,8 @@ def test_edge_gating():
 
     # Test with normal inputs
     batch_size = 32
-    image = torch.randn(batch_size, 3, 224, 224)
-    saliency = torch.randn(batch_size, 1, 224, 224)
+    image = torch.randn(batch_size, 3, 224, 224).abs()  # Use positive values
+    saliency = torch.randn(batch_size, 1, 224, 224).abs()
 
     print(f"Input shapes:")
     print(f"  image: {image.shape}")
