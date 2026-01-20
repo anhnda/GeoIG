@@ -176,19 +176,61 @@ class PatternPredictor:
         print(f"  ✓ Cache loaded: {len(class_index)} classes, {total_samples} samples")
         return class_index
 
-    def get_random_images_from_other_classes(self, target_class_id, num_images=20):
+    def get_similar_classes(self, target_class_id, num_similar=50):
+        """
+        Get similar classes to the target class based on WordNet hierarchy.
+
+        For stronger verification, we want to test on "adjacent" classes
+        (e.g., other birds if target is ostrich) rather than random classes.
+
+        Args:
+            target_class_id: Target class
+            num_similar: Number of similar classes to return
+
+        Returns:
+            List of class IDs that are semantically similar
+        """
+        # Simple heuristic: Get classes with nearby IDs (often semantically related in ImageNet)
+        # and some random ones for diversity
+        nearby_classes = []
+
+        # Get nearby classes (within ±100 IDs, often related in ImageNet structure)
+        for offset in range(1, 101):
+            for delta in [offset, -offset]:
+                candidate = target_class_id + delta
+                if 0 <= candidate < self.num_classes and candidate != target_class_id:
+                    nearby_classes.append(candidate)
+                    if len(nearby_classes) >= num_similar // 2:
+                        break
+            if len(nearby_classes) >= num_similar // 2:
+                break
+
+        # Add some random classes for diversity
+        all_other_classes = [c for c in range(self.num_classes) if c != target_class_id]
+        random_classes = random.sample(all_other_classes, min(num_similar // 2, len(all_other_classes)))
+
+        similar_classes = nearby_classes + random_classes
+        return similar_classes[:num_similar]
+
+    def get_random_images_from_other_classes(self, target_class_id, num_images=20, use_similar_classes=False):
         """
         Get random images from classes OTHER than the target class.
 
         Args:
             target_class_id: Class to exclude
             num_images: Number of random images to retrieve
+            use_similar_classes: If True, sample from semantically similar classes only
 
         Returns:
             List of (image_tensor, original_class_id) tuples
         """
-        # Get all class IDs except target
-        other_class_ids = [c for c in range(self.num_classes) if c != target_class_id]
+        # Get class pool
+        if use_similar_classes:
+            other_class_ids = self.get_similar_classes(target_class_id)
+            print(f"  Using {len(other_class_ids)} similar/adjacent classes for harder test")
+        else:
+            other_class_ids = [c for c in range(self.num_classes) if c != target_class_id]
+            print(f"  Using all {len(other_class_ids)} other classes (random sampling)")
 
         # Sample random images
         sampled_images = []
@@ -217,7 +259,7 @@ class PatternPredictor:
                 sample_idx = item.get('sample_index', item.get('index'))
 
                 # Load image from dataset
-                image_pil, label = self.imagenet_dataset[sample_idx]
+                image_pil, _ = self.imagenet_dataset[sample_idx]
                 img_tensor = self.image_transform(image_pil)  # (3, 224, 224)
 
                 sampled_images.append((img_tensor, random_class))
@@ -271,7 +313,7 @@ class PatternPredictor:
         return torch.from_numpy(injected).float()
 
     def verify_class_patterns(self, class_id, num_test_images=20, min_usage_threshold=0.0,
-                            alpha=0.3, injection_method='additive'):
+                            alpha=0.3, injection_method='additive', use_similar_classes=False):
         """
         Verify that patterns for a class are predictive using pattern injection.
 
@@ -284,6 +326,7 @@ class PatternPredictor:
             min_usage_threshold: Minimum usage percentage to include (0.0 = exclude zero patterns)
             alpha: Pattern injection strength (0-1)
             injection_method: 'additive' or 'multiplicative'
+            use_similar_classes: If True, test on semantically similar classes (harder test)
 
         Returns:
             dict: Results including probability changes and statistics
@@ -334,7 +377,9 @@ class PatternPredictor:
         print(f"Sampling {num_test_images} random images from OTHER classes...")
         print(f"{'='*80}")
 
-        test_images = self.get_random_images_from_other_classes(class_id, num_test_images)
+        test_images = self.get_random_images_from_other_classes(
+            class_id, num_test_images, use_similar_classes=use_similar_classes
+        )
         print(f"✓ Sampled {len(test_images)} test images")
 
         if not test_images:
@@ -357,8 +402,10 @@ class PatternPredictor:
 
                 prob_increases = []
                 rank_improvements = []
+                log_odds_increases = []
+                prediction_flips = 0  # Count when target becomes top-1
 
-                for img_idx, (img_tensor, orig_class) in enumerate(test_images):
+                for _, (img_tensor, orig_class) in enumerate(test_images):
                     # Get baseline prediction (without pattern)
                     img_normalized = self.normalize(img_tensor).unsqueeze(0).to(self.device)
                     baseline_logits = self.classifier(img_normalized)
@@ -368,6 +415,7 @@ class PatternPredictor:
                     # Get baseline rank of target class
                     sorted_indices = torch.argsort(baseline_probs, descending=True)
                     baseline_rank = (sorted_indices == class_id).nonzero(as_tuple=True)[0].item()
+                    baseline_top1 = sorted_indices[0].item()
 
                     # Inject pattern into image
                     injected_img = self.inject_pattern_into_image(
@@ -383,19 +431,34 @@ class PatternPredictor:
                     # Get new rank of target class
                     sorted_indices_inj = torch.argsort(injected_probs, descending=True)
                     injected_rank = (sorted_indices_inj == class_id).nonzero(as_tuple=True)[0].item()
+                    injected_top1 = sorted_indices_inj[0].item()
 
                     # Calculate changes
                     prob_increase = injected_prob - baseline_prob
                     rank_improvement = baseline_rank - injected_rank  # Positive = better rank
 
+                    # Calculate log-odds change (more sensitive to tail probability changes)
+                    # log-odds = ln(p / (1-p))
+                    eps = 1e-10  # Avoid log(0)
+                    baseline_log_odds = np.log((baseline_prob + eps) / (1 - baseline_prob + eps))
+                    injected_log_odds = np.log((injected_prob + eps) / (1 - injected_prob + eps))
+                    log_odds_increase = injected_log_odds - baseline_log_odds
+
+                    # Check if prediction flipped to target class
+                    if injected_top1 == class_id and baseline_top1 != class_id:
+                        prediction_flips += 1
+
                     prob_increases.append(prob_increase)
                     rank_improvements.append(rank_improvement)
+                    log_odds_increases.append(log_odds_increase)
 
                 # Calculate statistics for this pattern
                 avg_prob_increase = np.mean(prob_increases)
                 median_prob_increase = np.median(prob_increases)
                 positive_increases = sum(1 for x in prob_increases if x > 0)
                 avg_rank_improvement = np.mean(rank_improvements)
+                avg_log_odds_increase = np.mean(log_odds_increases)
+                median_log_odds_increase = np.median(log_odds_increases)
 
                 result = {
                     'pattern_id': pattern_id,
@@ -405,33 +468,57 @@ class PatternPredictor:
                     'positive_increases': positive_increases,
                     'success_rate': positive_increases / len(test_images),
                     'avg_rank_improvement': avg_rank_improvement,
+                    'avg_log_odds_increase': avg_log_odds_increase,
+                    'median_log_odds_increase': median_log_odds_increase,
+                    'prediction_flips': prediction_flips,
+                    'flip_rate': prediction_flips / len(test_images),
                     'prob_increases': prob_increases,
-                    'rank_improvements': rank_improvements
+                    'rank_improvements': rank_improvements,
+                    'log_odds_increases': log_odds_increases
                 }
 
                 pattern_results.append(result)
 
                 # Print result
                 success_rate = positive_increases / len(test_images) * 100
+                flip_rate = prediction_flips / len(test_images) * 100
                 status = "✓ EFFECTIVE" if success_rate > 50 else "~ WEAK" if success_rate > 25 else "✗ INEFFECTIVE"
                 print(f"  {status}")
                 print(f"  Avg probability increase: {avg_prob_increase:+.6f} ({avg_prob_increase*100:+.4f}%)")
                 print(f"  Median probability increase: {median_prob_increase:+.6f} ({median_prob_increase*100:+.4f}%)")
+                print(f"  Avg log-odds increase: {avg_log_odds_increase:+.4f}")
+                print(f"  Median log-odds increase: {median_log_odds_increase:+.4f}")
                 print(f"  Success rate: {positive_increases}/{len(test_images)} ({success_rate:.1f}%)")
                 print(f"  Avg rank improvement: {avg_rank_improvement:+.1f}")
+                print(f"  Prediction flips (→ Top-1): {prediction_flips}/{len(test_images)} ({flip_rate:.1f}%)")
 
         # Calculate overall statistics
         successful_patterns = sum(1 for r in pattern_results if r['success_rate'] > 0.5)
         avg_success_rate = np.mean([r['success_rate'] for r in pattern_results])
+        avg_log_odds = np.mean([r['avg_log_odds_increase'] for r in pattern_results])
+        total_flips = sum(r['prediction_flips'] for r in pattern_results)
+        avg_flip_rate = np.mean([r['flip_rate'] for r in pattern_results])
 
         print(f"\n{'='*80}")
         print(f"RESULTS SUMMARY")
         print(f"{'='*80}")
         print(f"Class: {class_name} (Class {class_id})")
-        print(f"Total patterns tested: {len(valid_patterns)}")
-        print(f"Effective patterns (>50% success): {successful_patterns}")
-        print(f"Average success rate: {avg_success_rate*100:.2f}%")
+        print(f"Injection strength (alpha): {alpha}")
+        print(f"Test regime: {'Similar/Adjacent classes (harder)' if use_similar_classes else 'Random classes (easier)'}")
+        print(f"\nPattern Statistics:")
+        print(f"  Total patterns tested: {len(valid_patterns)}")
+        print(f"  Effective patterns (>50% success): {successful_patterns}")
+        print(f"  Average success rate: {avg_success_rate*100:.2f}%")
+        print(f"  Average log-odds increase: {avg_log_odds:+.4f}")
+        print(f"\nPrediction Flips (→ Top-1):")
+        print(f"  Total flips across all patterns: {total_flips}")
+        print(f"  Average flip rate: {avg_flip_rate*100:.2f}%")
         print(f"\nConclusion: {'✓ Patterns are PREDICTIVE' if successful_patterns > 0 else '✗ Patterns are NOT predictive'}")
+
+        if successful_patterns > 0 and avg_flip_rate > 0.1:
+            print(f"✓✓ Patterns can FLIP predictions to target class!")
+        elif successful_patterns > 0:
+            print(f"✓ Patterns shift probabilities but rarely flip predictions (try higher alpha)")
 
         return {
             'class_id': class_id,
@@ -440,10 +527,14 @@ class PatternPredictor:
             'tested_patterns': len(valid_patterns),
             'successful_injections': successful_patterns,
             'avg_success_rate': avg_success_rate,
+            'avg_log_odds_increase': avg_log_odds,
+            'total_prediction_flips': total_flips,
+            'avg_flip_rate': avg_flip_rate,
             'injection_params': {
                 'alpha': alpha,
                 'method': injection_method,
-                'num_test_images': len(test_images)
+                'num_test_images': len(test_images),
+                'use_similar_classes': use_similar_classes
             },
             'pattern_results': pattern_results
         }
@@ -469,6 +560,8 @@ def main():
     parser.add_argument('--injection_method', type=str, default='additive',
                        choices=['additive', 'multiplicative'],
                        help='Pattern injection method (default: additive)')
+    parser.add_argument('--use_similar_classes', action='store_true',
+                       help='Test on semantically similar/adjacent classes (harder test)')
     parser.add_argument('--images_per_class', type=int, default=100,
                        help='Number of images per class (must match saliency generation)')
     parser.add_argument('--device', type=str, default='cuda',
@@ -501,7 +594,8 @@ def main():
         num_test_images=args.num_test_images,
         min_usage_threshold=args.min_usage,
         alpha=args.alpha,
-        injection_method=args.injection_method
+        injection_method=args.injection_method,
+        use_similar_classes=args.use_similar_classes
     )
 
     # Save results if requested
@@ -517,6 +611,8 @@ def main():
                 pattern['prob_increases'] = [float(x) for x in pattern['prob_increases']]
             if 'rank_improvements' in pattern:
                 pattern['rank_improvements'] = [float(x) for x in pattern['rank_improvements']]
+            if 'log_odds_increases' in pattern:
+                pattern['log_odds_increases'] = [float(x) for x in pattern['log_odds_increases']]
 
         with open(output_path, 'w') as f:
             json.dump(results_json, f, indent=2)
