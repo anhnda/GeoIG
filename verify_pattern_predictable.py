@@ -604,15 +604,23 @@ def main():
         output_path = Path(args.output)
         output_path.parent.mkdir(exist_ok=True, parents=True)
 
-        # Convert numpy arrays to lists for JSON serialization
-        results_json = results.copy()
-        for pattern in results_json.get('pattern_results', []):
-            if 'prob_increases' in pattern:
-                pattern['prob_increases'] = [float(x) for x in pattern['prob_increases']]
-            if 'rank_improvements' in pattern:
-                pattern['rank_improvements'] = [float(x) for x in pattern['rank_improvements']]
-            if 'log_odds_increases' in pattern:
-                pattern['log_odds_increases'] = [float(x) for x in pattern['log_odds_increases']]
+        # Convert numpy arrays and types to native Python types for JSON serialization
+        def convert_to_native(obj):
+            """Recursively convert numpy types to native Python types."""
+            if isinstance(obj, dict):
+                return {k: convert_to_native(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_native(item) for item in obj]
+            elif isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return [convert_to_native(item) for item in obj.tolist()]
+            else:
+                return obj
+
+        results_json = convert_to_native(results)
 
         with open(output_path, 'w') as f:
             json.dump(results_json, f, indent=2)
