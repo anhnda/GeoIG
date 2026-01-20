@@ -688,10 +688,12 @@ class AdvancedLDDMMLoss(nn.Module):
         return diff_h.mean() + diff_w.mean()
 
     def mass_conservation_loss(self, h_original, h_aligned):
-        """Enforce total intensity preservation."""
+        """Enforce total intensity preservation using relative change."""
         mass_original = h_original.sum(dim=(1, 2, 3))
         mass_aligned = h_aligned.sum(dim=(1, 2, 3))
-        return torch.abs(mass_aligned - mass_original).mean()
+        # Use relative change instead of absolute to handle unnormalized saliency maps
+        relative_change = torch.abs(mass_aligned - mass_original) / (mass_original + 1e-8)
+        return relative_change.mean()
 
     def entropy_loss(self, cluster_probs):
         """Entropy regularization to encourage confident assignments."""
