@@ -26,10 +26,11 @@ import joblib
 from PIL import Image
 from torchvision import transforms
 
-# Import model components from geo_patterns
+# Import model components from geo_patterns and geo_x
 import sys
 sys.path.append('.')
 from geo_patterns import LDDMM_GlobalPatternPipeline
+from geo_x import AdvancedLDDMM_Pipeline
 from full_classes import IMAGENET2012_CLASSES
 from saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
 
@@ -78,12 +79,31 @@ class PatternVisualizer:
         self.k_subpatterns = checkpoint['templates'].shape[1]
 
         # Auto-detect velocity field resolution from checkpoint
-        # Find the LAST linear layer in v_head (the output layer)
+        # Try to detect if this is an advanced (multi-scale) or simple (single-scale) checkpoint
+        # Advanced model has: predictor.coarse_v_head and predictor.fine_v_head
+        # Simple model has: predictor.v_head
+
+        # First, try to find fine_v_head (advanced model)
         v_head_keys = [k for k in checkpoint['model_state_dict'].keys()
-                       if 'predictor.v_head' in k and 'weight' in k and 'Linear' not in k]
+                       if 'predictor.fine_v_head' in k and 'weight' in k and 'Linear' not in k]
 
         if not v_head_keys:
-            raise ValueError("Could not find velocity head in checkpoint")
+            # Try simple model (single v_head)
+            v_head_keys = [k for k in checkpoint['model_state_dict'].keys()
+                           if 'predictor.v_head' in k and 'weight' in k and 'Linear' not in k]
+
+        if not v_head_keys:
+            # Last resort: try coarse_v_head
+            v_head_keys = [k for k in checkpoint['model_state_dict'].keys()
+                           if 'predictor.coarse_v_head' in k and 'weight' in k and 'Linear' not in k]
+
+        if not v_head_keys:
+            # If still not found, print available keys to help debug
+            print("\nAvailable model keys:")
+            for k in sorted(checkpoint['model_state_dict'].keys()):
+                if 'predictor' in k and 'weight' in k:
+                    print(f"  {k}: {checkpoint['model_state_dict'][k].shape}")
+            raise ValueError("Could not find velocity head in checkpoint. See available keys above.")
 
         # Sort to get the last layer (highest index)
         v_head_keys.sort()
@@ -96,20 +116,37 @@ class PatternVisualizer:
         v_res_size = int(np.sqrt(v_dim / 2))
         v_res = (v_res_size, v_res_size)
 
+        # Detect model type based on checkpoint keys
+        has_fine_v_head = any('fine_v_head' in k for k in checkpoint['model_state_dict'].keys())
+        has_coarse_v_head = any('coarse_v_head' in k for k in checkpoint['model_state_dict'].keys())
+        is_advanced_model = has_fine_v_head or has_coarse_v_head
+
         print(f"Loaded model:")
+        print(f"  Type: {'Advanced (Multi-Scale)' if is_advanced_model else 'Simple (Single-Scale)'}")
         print(f"  Classes: {self.num_classes}")
         print(f"  Sub-patterns per class: {self.k_subpatterns}")
         print(f"  Velocity field resolution: {v_res} (auto-detected)")
         print(f"  Epoch: {checkpoint.get('epoch', 'unknown')}")
 
         # Create model with auto-detected architecture
-        self.model = LDDMM_GlobalPatternPipeline(
-            num_classes=self.num_classes,
-            k_subpatterns=self.k_subpatterns,
-            img_res=(224, 224),
-            device=device,
-            v_res=v_res
-        ).to(device)
+        self.is_advanced_model = is_advanced_model
+        if is_advanced_model:
+            self.model = AdvancedLDDMM_Pipeline(
+                num_classes=self.num_classes,
+                k_subpatterns=self.k_subpatterns,
+                img_res=(224, 224),
+                device=device,
+                use_ot=True,  # Default to True for advanced model
+                use_edge_gating=False  # Default to False (no edge gating during visualization)
+            ).to(device)
+        else:
+            self.model = LDDMM_GlobalPatternPipeline(
+                num_classes=self.num_classes,
+                k_subpatterns=self.k_subpatterns,
+                img_res=(224, 224),
+                device=device,
+                v_res=v_res
+            ).to(device)
 
         # Load weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -319,7 +356,17 @@ class PatternVisualizer:
 
         # Forward pass
         with torch.no_grad():
-            h_aligned, cluster_probs, phi, _ = self.model(h_i, update_templates=False)
+            if self.is_advanced_model:
+                # Advanced model returns: h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine
+                h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine = self.model(
+                    h_i, update_templates=False
+                )
+                # Use fine deformation for visualization (final result)
+                phi = phi_fine
+            else:
+                # Simple model returns: h_aligned, cluster_probs, phi, v
+                h_aligned, cluster_probs, phi, _ = self.model(h_i, update_templates=False)
+
             cluster_assigned = torch.argmax(cluster_probs, dim=-1).item()
 
         # Move to CPU for visualization
@@ -489,7 +536,12 @@ class PatternVisualizer:
 
             # Forward pass
             with torch.no_grad():
-                h_aligned, cluster_probs, _, _ = self.model(h_i, update_templates=False)
+                if self.is_advanced_model:
+                    # Advanced model returns: h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine
+                    h_aligned, cluster_probs, _, _, _, _ = self.model(h_i, update_templates=False)
+                else:
+                    # Simple model returns: h_aligned, cluster_probs, phi, v
+                    h_aligned, cluster_probs, _, _ = self.model(h_i, update_templates=False)
                 cluster_assigned = torch.argmax(cluster_probs, dim=-1).item()
 
             col = 0
