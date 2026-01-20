@@ -543,7 +543,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
         unique_pairs = torch.unique(torch.stack([class_ids, cluster_assigned], dim=1), dim=0)
 
         for pair in unique_pairs:
-            c, k = pair[0].item(), pair[1].item()
+            c, k = pair[0], pair[1]  # Keep as tensors to avoid graph breaks
 
             # Find all samples for this (class, cluster)
             mask = (class_ids == c) & (cluster_assigned == k)
@@ -555,7 +555,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             # Limit number of samples to prevent OOM
             if samples.shape[0] > 16:
                 # Randomly sample 16 if too many
-                indices = torch.randperm(samples.shape[0])[:16]
+                indices = torch.randperm(samples.shape[0], device=samples.device)[:16]
                 samples = samples[indices]
 
             # Compute Wasserstein barycenter (reduced iterations to save memory)
@@ -588,18 +588,20 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             )
 
             # Normalize
-            if barycenter.max() > 0:
-                barycenter = barycenter / barycenter.max()
+            barycenter_max = barycenter.max()
+            if barycenter_max > 0:
+                barycenter = barycenter / barycenter_max
 
             # Blend with existing template (slow EMA for stability)
-            count = self.template_counts[c, k].item()
+            count = self.template_counts[c, k]  # Keep as tensor
             if count == 0:
                 self.templates[c, k] = barycenter
             else:
-                eta = min(0.1, 1.0 / (count + 1))  # Slower updates
+                eta = torch.clamp(torch.tensor(0.1, device=count.device),
+                                  max=1.0 / (count + 1))  # Slower updates, keep as tensor
                 self.templates[c, k] = (1 - eta) * self.templates[c, k] + eta * barycenter
 
-            self.template_counts[c, k] += mask.sum().item()
+            self.template_counts[c, k] += mask.sum()
 
             # Free intermediate tensors immediately
             del barycenter, barycenter_flat, top_k_values, top_k_indices, barycenter_sharp
@@ -1339,6 +1341,9 @@ class AdvancedLDDMMTrainer:
 # ==========================================
 
 def main():
+    # Configure torch.compile for better graph capture
+    torch._dynamo.config.capture_scalar_outputs = True
+
     parser = argparse.ArgumentParser(
         description='Advanced Geodesic Pattern Learning v2 - Refined for Sharp Structural Patterns',
         epilog="""
