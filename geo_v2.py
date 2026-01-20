@@ -1144,7 +1144,7 @@ class AdvancedLDDMMTrainer:
             lambda_template_sparsity=5.0,         # V2: AGGRESSIVE (1.5 → 5.0) for spike recovery
             lambda_spatial_diversity=0.3,         # Minimal spatial constraint
             lambda_compactness=10.0,              # STRONG: Prefer blob-like over line-like
-            lambda_mass_conservation=100.0,       # CRITICAL: Perfect mass conservation
+            lambda_mass_conservation=1.0,       # CRITICAL: Perfect mass conservation
             lambda_sparsity_match=10.0,           # CRITICAL: Preserve sparsity patterns
             lambda_tv=0.5,                        # Reduce fragmentation
             lambda_jacobian=50.0,                 # CRITICAL: Prevent spatial stretching/compression!
