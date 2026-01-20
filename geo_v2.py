@@ -809,6 +809,44 @@ class AdvancedLDDMMLoss(nn.Module):
 # Dataset (Lazy Loading with LRU Cache)
 # ==========================================
 
+def safe_collate_fn(batch):
+    """
+    Custom collate function that validates tensor shapes before batching.
+
+    Catches shape mismatches that cause [B, 0, H, W] errors.
+    """
+    # Unpack batch
+    if len(batch[0]) == 3:  # (saliency, label, image)
+        saliencies, labels, images = zip(*batch)
+    else:
+        raise ValueError(f"Unexpected batch item length: {len(batch[0])}")
+
+    # Validate each saliency map
+    for i, sal in enumerate(saliencies):
+        if sal.shape != (1, 224, 224):
+            raise ValueError(f"Sample {i}: Invalid saliency shape {sal.shape}, expected (1, 224, 224)")
+
+    # Validate each image if not None
+    if images[0] is not None:
+        for i, img in enumerate(images):
+            if img is not None and img.shape != (3, 224, 224):
+                raise ValueError(f"Sample {i}: Invalid image shape {img.shape}, expected (3, 224, 224)")
+
+    # Stack tensors
+    saliency_batch = torch.stack(saliencies, dim=0)  # [B, 1, H, W]
+    label_batch = torch.tensor(labels, dtype=torch.long)  # [B]
+
+    if images[0] is not None:
+        image_batch = torch.stack([img for img in images if img is not None], dim=0)  # [B, 3, H, W]
+    else:
+        image_batch = None
+
+    # Final validation
+    assert saliency_batch.shape[1] == 1, f"Saliency batch has {saliency_batch.shape[1]} channels, expected 1"
+
+    return saliency_batch, label_batch, image_batch
+
+
 class SaliencyMapDataset(Dataset):
     """
     Lazy-loading dataset with LRU cache for memory efficiency.
@@ -925,16 +963,26 @@ class SaliencyMapDataset(Dataset):
         Uses LRU cache to keep recently accessed batches in memory,
         minimizing disk I/O while avoiding memory explosion.
         """
-        batch_file, item_idx = self.sample_index[idx]
-        label = self.labels[idx]
+        try:
+            batch_file, item_idx = self.sample_index[idx]
+            label = self.labels[idx]
 
-        # Load batch from cache (or disk if not cached)
-        batch_data = self._load_batch_cached(batch_file)
-        item = batch_data[item_idx]
+            # Load batch from cache (or disk if not cached)
+            batch_data = self._load_batch_cached(batch_file)
+            item = batch_data[item_idx]
 
-        # Convert saliency map to tensor
-        # Expected: item['saliency_map'] has shape (H, W) = (224, 224)
-        saliency_np = item['saliency_map']
+            # Convert saliency map to tensor
+            # Expected: item['saliency_map'] has shape (H, W) = (224, 224)
+            if 'saliency_map' not in item:
+                raise KeyError(f"Sample {idx} (batch {batch_file}, item {item_idx}) missing 'saliency_map' key. Available keys: {list(item.keys())}")
+
+            saliency_np = item['saliency_map']
+        except Exception as e:
+            print(f"\n❌ ERROR loading sample {idx}:")
+            print(f"   Batch file: {batch_file}")
+            print(f"   Item index: {item_idx}")
+            print(f"   Error: {e}")
+            raise
 
         # Handle different possible input shapes
         if len(saliency_np.shape) == 2:
@@ -986,16 +1034,35 @@ class SaliencyMapDataset(Dataset):
                 image = torch.from_numpy(np.stack([saliency_2d] * 3, axis=0)).float()
 
             # Validate output shapes
-            assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
-            assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
-            assert image.shape[0] == 3, f"Image should have 3 channels, got {image.shape}"
-            assert image.shape[1:] == (224, 224), f"Image should be 224x224, got {image.shape}"
+            try:
+                assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
+                assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
+                assert image.shape[0] == 3, f"Image should have 3 channels, got {image.shape}"
+                assert image.shape[1:] == (224, 224), f"Image should be 224x224, got {image.shape}"
+            except AssertionError as e:
+                print(f"\n❌ Shape validation failed for sample {idx}:")
+                print(f"   Batch file: {batch_file}")
+                print(f"   Item index: {item_idx}")
+                print(f"   Saliency shape: {saliency.shape}")
+                print(f"   Image shape: {image.shape}")
+                print(f"   Original saliency_np shape: {saliency_np.shape}")
+                if 'rgb_image' in item:
+                    print(f"   Original rgb_image shape: {item['rgb_image'].shape}")
+                raise
 
             return saliency, label, image
         else:
             # Validate output shape
-            assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
-            assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
+            try:
+                assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
+                assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
+            except AssertionError as e:
+                print(f"\n❌ Shape validation failed for sample {idx}:")
+                print(f"   Batch file: {batch_file}")
+                print(f"   Item index: {item_idx}")
+                print(f"   Saliency shape: {saliency.shape}")
+                print(f"   Original saliency_np shape: {saliency_np.shape}")
+                raise
 
             return saliency, label, None
 
@@ -1330,7 +1397,8 @@ RECOMMENDED USAGE:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=0,  # Keep 0 for lazy loading to avoid pickling issues
-        pin_memory=True if torch.cuda.is_available() else False
+        pin_memory=True if torch.cuda.is_available() else False,
+        collate_fn=safe_collate_fn  # Custom collate to catch shape errors
     )
 
     print(f"\nDataLoader Configuration:")
