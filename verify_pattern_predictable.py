@@ -415,8 +415,8 @@ class PatternPredictor:
                 success_rate = positive_increases / len(test_images) * 100
                 status = "✓ EFFECTIVE" if success_rate > 50 else "~ WEAK" if success_rate > 25 else "✗ INEFFECTIVE"
                 print(f"  {status}")
-                print(f"  Avg probability increase: {avg_prob_increase:+.4f}")
-                print(f"  Median probability increase: {median_prob_increase:+.4f}")
+                print(f"  Avg probability increase: {avg_prob_increase:+.6f} ({avg_prob_increase*100:+.4f}%)")
+                print(f"  Median probability increase: {median_prob_increase:+.6f} ({median_prob_increase*100:+.4f}%)")
                 print(f"  Success rate: {positive_increases}/{len(test_images)} ({success_rate:.1f}%)")
                 print(f"  Avg rank improvement: {avg_rank_improvement:+.1f}")
 
