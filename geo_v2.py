@@ -519,7 +519,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     @torch.no_grad()
     def _update_template_bank_ot(self, h_aligned, class_ids, cluster_assigned,
-                                  sparsity_percentile=90, top_k_percent=3):
+                                  sparsity_percentile=99, top_k_percent=1):
         """
         Update template bank using Optimal Transport (Sinkhorn barycenter) with AGGRESSIVE top-K sharpening.
 
@@ -607,7 +607,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             del barycenter, barycenter_flat, top_k_values, top_k_indices, barycenter_sharp
 
     @torch.no_grad()
-    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=90):
+    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=99):
         """Fallback: Running average update with v2 aggressive sparsity (98th percentile)."""
         B = h_aligned.shape[0]
 
@@ -1143,8 +1143,8 @@ class AdvancedLDDMMTrainer:
             lambda_magnitude=0.00005,             # Allow detailed deformations
             lambda_diversity=2.0,                 # Use all K patterns
             lambda_template_diversity=2.0,        # Templates should differ
-            lambda_template_sparsity=5.0,         # V2: AGGRESSIVE (1.5 → 5.0) for spike recovery
-            lambda_spatial_diversity=0.3,         # Minimal spatial constraint
+            lambda_template_sparsity=7.0,         # V2: AGGRESSIVE (1.5 → 5.0) for spike recovery
+            lambda_spatial_diversity=1,         # Minimal spatial constraint
             lambda_compactness=10.0,              # STRONG: Prefer blob-like over line-like
             lambda_mass_conservation=1.0,       # CRITICAL: Perfect mass conservation
             lambda_sparsity_match=10.0,           # CRITICAL: Preserve sparsity patterns
