@@ -552,8 +552,17 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
             samples = h_aligned[mask]  # (N, 1, H, W)
 
-            # Compute Wasserstein barycenter
-            barycenter = sinkhorn_barycenter(samples, reg=0.05, num_iter=30)
+            # Limit number of samples to prevent OOM
+            if samples.shape[0] > 16:
+                # Randomly sample 16 if too many
+                indices = torch.randperm(samples.shape[0])[:16]
+                samples = samples[indices]
+
+            # Compute Wasserstein barycenter (reduced iterations to save memory)
+            barycenter = sinkhorn_barycenter(samples, reg=0.05, num_iter=10)
+
+            # Free memory immediately
+            del samples
 
             # === TOP-K SHARPENING ===
             # Keep only the top K% of pixels to prevent blur leakage
@@ -591,6 +600,9 @@ class AdvancedLDDMM_Pipeline(nn.Module):
                 self.templates[c, k] = (1 - eta) * self.templates[c, k] + eta * barycenter
 
             self.template_counts[c, k] += mask.sum().item()
+
+            # Free intermediate tensors immediately
+            del barycenter, barycenter_flat, top_k_values, top_k_indices, barycenter_sharp
 
     @torch.no_grad()
     def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=98):
@@ -912,17 +924,15 @@ def safe_collate_fn(batch):
 
 class SaliencyMapDataset(Dataset):
     """
-    Lazy-loading dataset with LRU cache for memory efficiency.
-
-    Only loads data from disk when needed, with intelligent caching
-    to balance between disk I/O and memory usage.
+    Fast dataset that loads ALL saliency maps into RAM during initialization.
+    RGB images are lazy-loaded on-demand to save memory.
     """
 
-    def __init__(self, data_dir, max_samples_per_class=None, load_images=False, cache_size=99999):
+    def __init__(self, data_dir, max_samples_per_class=None, load_images=False, cache_size=5):
         self.data_dir = Path(data_dir)
         self.saliency_dir = self.data_dir / "saliency_maps"
         self.load_images = load_images
-        self.cache_size = cache_size  # Number of batch files to keep in cache
+        self.cache_size = cache_size  # Number of batch files to keep in cache (for RGB images)
 
         metadata_path = self.data_dir / "metadata.pkl"
         if not metadata_path.exists():
@@ -931,17 +941,21 @@ class SaliencyMapDataset(Dataset):
         self.metadata = joblib.load(metadata_path)
 
         batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
-        print(f"Indexing {len(batch_files)} batch files (lazy loading mode)...")
+        print(f"Loading {len(batch_files)} batch files - Saliency maps INTO RAM, RGB lazy-loaded...")
 
-        # Build index: stores (batch_file_path, item_index_in_batch) for each sample
-        self.sample_index = []  # [(batch_file, item_idx), ...]
+        # Store ALL saliency maps in RAM
+        self.saliency_maps = []  # List of tensors
         self.labels = []
+
+        # For lazy RGB loading: store (batch_file, item_idx)
+        self.rgb_index = []  # [(batch_file, item_idx), ...] for lazy RGB loading
+
         class_counts = defaultdict(int)
 
         # Validation counters
         corrupted_samples = 0
 
-        for batch_file in tqdm(batch_files, desc="Building index"):
+        for batch_file in tqdm(batch_files, desc="Loading saliency maps into RAM"):
             batch_data = joblib.load(batch_file)
 
             for item_idx, item in enumerate(batch_data):
@@ -953,9 +967,16 @@ class SaliencyMapDataset(Dataset):
                     corrupted_samples += 1
                     continue
 
-                saliency_shape = item['saliency_map'].shape
+                saliency_np = item['saliency_map']
+                saliency_shape = saliency_np.shape
                 if len(saliency_shape) < 2 or saliency_shape[-2:] != (224, 224):
                     print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - invalid shape {saliency_shape}")
+                    corrupted_samples += 1
+                    continue
+
+                # Check for corrupted data
+                if 0 in saliency_shape:
+                    print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - corrupted shape {saliency_shape}")
                     corrupted_samples += 1
                     continue
 
@@ -966,39 +987,58 @@ class SaliencyMapDataset(Dataset):
                         print(f"WARNING: Invalid RGB shape {rgb_shape} in {batch_file.name}, item {item_idx}")
 
                 if max_samples_per_class is None or class_counts[label] < max_samples_per_class:
-                    self.sample_index.append((str(batch_file), item_idx))
+                    # Convert saliency map to tensor and store in RAM
+                    if len(saliency_shape) == 2:
+                        saliency_tensor = torch.from_numpy(saliency_np).float().unsqueeze(0)  # (1, H, W)
+                    elif len(saliency_shape) == 3:
+                        if saliency_np.shape[0] in [1, 3]:
+                            saliency_tensor = torch.from_numpy(saliency_np).float()
+                        else:
+                            saliency_tensor = torch.from_numpy(saliency_np).float().permute(2, 0, 1)
+                        if saliency_tensor.shape[0] > 1:
+                            saliency_tensor = saliency_tensor.mean(dim=0, keepdim=True)
+                    else:
+                        print(f"WARNING: Skipping item {item_idx} - unexpected shape {saliency_shape}")
+                        corrupted_samples += 1
+                        continue
+
+                    # Verify tensor has correct shape
+                    if saliency_tensor.shape[0] != 1 or saliency_tensor.shape[1:] != (224, 224):
+                        print(f"WARNING: Skipping item {item_idx} - bad tensor shape {saliency_tensor.shape}")
+                        corrupted_samples += 1
+                        continue
+
+                    self.saliency_maps.append(saliency_tensor)
                     self.labels.append(label)
+                    self.rgb_index.append((str(batch_file), item_idx))
                     class_counts[label] += 1
 
-            # Free memory after processing each batch
+            # Free batch data memory
             del batch_data
-            if batch_file == batch_files[0]:  # Only after first batch
-                gc.collect()
+            gc.collect()
 
         if corrupted_samples > 0:
-            print(f"⚠️  Skipped {corrupted_samples} corrupted samples during indexing")
+            print(f"⚠️  Skipped {corrupted_samples} corrupted samples during loading")
 
         self.labels = torch.tensor(self.labels, dtype=torch.long)
 
-        # Calculate memory savings
-        num_samples = len(self.sample_index)
+        # Calculate memory usage
+        num_samples = len(self.saliency_maps)
         saliency_size_mb = num_samples * 1 * 224 * 224 * 4 / (1024**2)
 
-        num_batch_files = len(batch_files)
-        cache_mode = "ALL BATCHES CACHED" if cache_size >= num_batch_files else f"LRU CACHE ({cache_size} batches)"
-        print(f"\n✓ Indexed {num_samples} samples ({cache_mode})")
-        print(f"  Index memory: ~{len(self.sample_index) * 64 / (1024**2):.1f} MB")
-        print(f"  Batch cache size: {cache_size} / {num_batch_files} batches")
+        print(f"\n✅ Loaded {num_samples} saliency maps into RAM")
+        print(f"   Saliency memory: ~{saliency_size_mb:.1f} MB")
 
         if load_images:
             images_size_mb = num_samples * 3 * 224 * 224 * 4 / (1024**2)
-            print(f"  Memory saved vs full load: ~{saliency_size_mb + images_size_mb:.1f} MB")
-            print(f"  Will load RGB images on-the-fly from disk")
+            num_batch_files = len(batch_files)
+            cache_mode = "ALL CACHED" if cache_size >= num_batch_files else f"LRU {cache_size}"
+            print(f"   RGB images: Lazy-loaded ({cache_mode})")
+            print(f"   RGB memory if fully loaded: ~{images_size_mb:.1f} MB (NOT loaded)")
+            # Create LRU cached batch loader for RGB images only
+            self._load_batch_cached = lru_cache(maxsize=cache_size)(self._load_batch_uncached)
         else:
-            print(f"  Memory saved vs full load: ~{saliency_size_mb:.1f} MB")
-
-        # Create LRU cached batch loader
-        self._load_batch_cached = lru_cache(maxsize=cache_size)(self._load_batch_uncached)
+            print(f"   RGB images: Not used")
 
     def _load_batch_uncached(self, batch_file):
         """Load a batch file from disk (uncached)."""
@@ -1019,135 +1059,61 @@ class SaliencyMapDataset(Dataset):
         return None
 
     def __len__(self):
-        return len(self.sample_index)
+        return len(self.saliency_maps)
 
     def __getitem__(self, idx):
         """
-        Lazy load a single sample from disk.
-
-        Uses LRU cache to keep recently accessed batches in memory,
-        minimizing disk I/O while avoiding memory explosion.
+        Fast access: saliency maps are pre-loaded, RGB images are lazy-loaded.
         """
-        try:
-            batch_file, item_idx = self.sample_index[idx]
-            label = self.labels[idx]
+        # Get pre-loaded saliency map (already a tensor in RAM)
+        saliency = self.saliency_maps[idx]
+        label = self.labels[idx]
 
-            # Load batch from cache (or disk if not cached)
-            batch_data = self._load_batch_cached(batch_file)
-            item = batch_data[item_idx]
-
-            # Convert saliency map to tensor
-            # Expected: item['saliency_map'] has shape (H, W) = (224, 224)
-            if 'saliency_map' not in item:
-                raise KeyError(f"Sample {idx} (batch {batch_file}, item {item_idx}) missing 'saliency_map' key. Available keys: {list(item.keys())}")
-
-            saliency_np = item['saliency_map']
-        except Exception as e:
-            print(f"\n❌ ERROR loading sample {idx}:")
-            print(f"   Batch file: {batch_file}")
-            print(f"   Item index: {item_idx}")
-            print(f"   Error: {e}")
-            raise
-
-        # Handle different possible input shapes
-        # CRITICAL CHECK: Detect corrupted data with 0 channels
-        if 0 in saliency_np.shape:
-            print(f"\n❌❌❌ CORRUPTED DATA DETECTED at index {idx}!")
-            print(f"   Batch file: {batch_file}")
-            print(f"   Item index: {item_idx}")
-            print(f"   saliency_np.shape = {saliency_np.shape}")
-            print(f"   This data is CORRUPTED ON DISK - fix your data preprocessing!")
-            raise ValueError(f"Sample {idx}: Corrupted saliency map with 0 dimension: {saliency_np.shape}")
-
-        if len(saliency_np.shape) == 2:
-            # Shape is (H, W) -> add channel dimension -> (1, H, W)
-            saliency = torch.from_numpy(saliency_np).float().unsqueeze(0)
-        elif len(saliency_np.shape) == 3:
-            # Shape is already (C, H, W) or (H, W, C)
-            if saliency_np.shape[0] in [1, 3]:  # Likely (C, H, W)
-                saliency = torch.from_numpy(saliency_np).float()
-            else:  # Likely (H, W, C)
-                saliency = torch.from_numpy(saliency_np).float().permute(2, 0, 1)
-            # Ensure single channel
-            if saliency.shape[0] > 1:
-                saliency = saliency.mean(dim=0, keepdim=True)
-        else:
-            raise ValueError(f"Unexpected saliency map shape: {saliency_np.shape}")
-
-        # CRITICAL CHECK: Verify saliency tensor has correct shape after conversion
-        if saliency.shape[0] == 0:
-            print(f"\n❌❌❌ CRITICAL ERROR: saliency tensor has 0 channels!")
-            print(f"   Sample index: {idx}")
-            print(f"   Batch file: {batch_file}")
-            print(f"   Item index: {item_idx}")
-            print(f"   Original saliency_np.shape: {saliency_np.shape}")
-            print(f"   Converted saliency.shape: {saliency.shape}")
-            raise ValueError(f"Sample {idx}: saliency tensor has 0 channels: {saliency.shape}")
-
-        # Optionally load RGB image
+        # Optionally lazy-load RGB image from disk
         if self.load_images:
-            if 'rgb_image' in item:
-                image_np = item['rgb_image']
-
-                # Handle different possible RGB shapes
-                if len(image_np.shape) == 3:
-                    # Expected: (3, H, W)
-                    if image_np.shape[0] == 3:
-                        image = torch.from_numpy(image_np).float()
-                    elif image_np.shape[2] == 3:
-                        # Shape is (H, W, 3) -> transpose to (3, H, W)
-                        image = torch.from_numpy(image_np).float().permute(2, 0, 1)
-                    else:
-                        raise ValueError(f"Unexpected RGB image shape: {image_np.shape}")
-                else:
-                    raise ValueError(f"RGB image should be 3D, got shape: {image_np.shape}")
-
-                # Normalize to [0, 1] if needed
-                if image.max() > 1.0:
-                    image = image / 255.0
-            elif 'image' in item:
-                image_np = item['image']
-                image = torch.from_numpy(image_np).float()
-                if len(image.shape) == 3 and image.shape[2] == 3:
-                    image = image.permute(2, 0, 1)
-                if image.max() > 1.0:
-                    image = image / 255.0
-            else:
-                # Fallback: create dummy RGB from saliency (remove channel dim for stacking)
-                saliency_2d = saliency.squeeze(0).numpy()
-                image = torch.from_numpy(np.stack([saliency_2d] * 3, axis=0)).float()
-
-            # Validate output shapes
             try:
-                assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
-                assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
-                assert image.shape[0] == 3, f"Image should have 3 channels, got {image.shape}"
-                assert image.shape[1:] == (224, 224), f"Image should be 224x224, got {image.shape}"
-            except AssertionError as e:
-                print(f"\n❌ Shape validation failed for sample {idx}:")
-                print(f"   Batch file: {batch_file}")
-                print(f"   Item index: {item_idx}")
-                print(f"   Saliency shape: {saliency.shape}")
-                print(f"   Image shape: {image.shape}")
-                print(f"   Original saliency_np shape: {saliency_np.shape}")
+                batch_file, item_idx = self.rgb_index[idx]
+
+                # Load batch from cache (or disk if not cached)
+                batch_data = self._load_batch_cached(batch_file)
+                item = batch_data[item_idx]
+
                 if 'rgb_image' in item:
-                    print(f"   Original rgb_image shape: {item['rgb_image'].shape}")
-                raise
+                    image_np = item['rgb_image']
+
+                    # Handle different possible RGB shapes
+                    if len(image_np.shape) == 3:
+                        if image_np.shape[0] == 3:
+                            image = torch.from_numpy(image_np).float()
+                        elif image_np.shape[2] == 3:
+                            image = torch.from_numpy(image_np).float().permute(2, 0, 1)
+                        else:
+                            raise ValueError(f"Unexpected RGB image shape: {image_np.shape}")
+                    else:
+                        raise ValueError(f"RGB image should be 3D, got shape: {image_np.shape}")
+
+                    # Normalize to [0, 1] if needed
+                    if image.max() > 1.0:
+                        image = image / 255.0
+                elif 'image' in item:
+                    image_np = item['image']
+                    image = torch.from_numpy(image_np).float()
+                    if len(image.shape) == 3 and image.shape[2] == 3:
+                        image = image.permute(2, 0, 1)
+                    if image.max() > 1.0:
+                        image = image / 255.0
+                else:
+                    # Fallback: create dummy RGB from saliency
+                    saliency_2d = saliency.squeeze(0)
+                    image = saliency_2d.repeat(3, 1, 1)
+            except Exception as e:
+                print(f"\n⚠️  Warning: Failed to load RGB for sample {idx}: {e}")
+                # Fallback to dummy RGB
+                saliency_2d = saliency.squeeze(0)
+                image = saliency_2d.repeat(3, 1, 1)
 
             return saliency, label, image
         else:
-            # Validate output shape
-            try:
-                assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
-                assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
-            except AssertionError as e:
-                print(f"\n❌ Shape validation failed for sample {idx}:")
-                print(f"   Batch file: {batch_file}")
-                print(f"   Item index: {item_idx}")
-                print(f"   Saliency shape: {saliency.shape}")
-                print(f"   Original saliency_np shape: {saliency_np.shape}")
-                raise
-
             return saliency, label, None
 
 
@@ -1285,9 +1251,13 @@ class AdvancedLDDMMTrainer:
 
             pbar.set_postfix(postfix_dict)
 
-            # Periodic GPU memory cleanup
-            if batch_idx % 100 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Periodic memory cleanup
+            if batch_idx % 50 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # Also run Python GC to free RAM
+                import gc
+                gc.collect()
 
         # Average losses
         avg_losses = {key: value / num_batches for key, value in epoch_losses.items()}
@@ -1439,8 +1409,8 @@ RECOMMENDED USAGE:
                        help='Max samples per class (default: None = all)')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_v2',
                        help='Checkpoint directory (default: ./checkpoints_v2)')
-    parser.add_argument('--cache_size', type=int, default=99999,
-                       help='Number of batch files to cache in memory (default: 99999 = cache all, use low value only if RAM limited)')
+    parser.add_argument('--cache_size', type=int, default=5,
+                       help='Number of RGB batch files to cache in memory (default: 5, increase if you have RAM)')
 
     args = parser.parse_args()
 
@@ -1464,6 +1434,8 @@ RECOMMENDED USAGE:
     print(f"\nFeatures:")
     print(f"  - Multi-scale coarse-to-fine alignment (14×14 → 112×112)")
     print(f"  - Optimal Transport: {args.use_ot}")
+    if args.use_ot:
+        print(f"    ⚠️  OT uses more RAM - if you get OOM, disable with --no_ot")
     print(f"  - Edge-aware gating: {args.use_edge_gating}")
 
     # Load dataset
@@ -1475,15 +1447,14 @@ RECOMMENDED USAGE:
         cache_size=args.cache_size  # Number of batch files to cache
     )
 
-    # DataLoader with parallel loading
+    # DataLoader - use 0 workers to avoid RAM duplication across processes
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,  # Parallel data loading for better throughput
+        num_workers=0,  # Single process to save RAM (multiprocessing duplicates data)
         pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=safe_collate_fn,  # Custom collate to catch shape errors
-        persistent_workers=True  # Keep workers alive between epochs
+        collate_fn=safe_collate_fn  # Custom collate to catch shape errors
     )
 
     print(f"\nDataLoader Configuration:")
