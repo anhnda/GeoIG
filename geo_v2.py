@@ -849,18 +849,26 @@ def safe_collate_fn(batch):
             raise ValueError(f"Sample {i}: Invalid saliency shape {sal.shape}, expected (1, 224, 224)")
 
     # Validate each image if not None
-    if images[0] is not None:
+    # Check if ANY image is None - if so, we can't use images for this batch
+    has_any_none = any(img is None for img in images)
+
+    if not has_any_none and images[0] is not None:
         for i, img in enumerate(images):
-            if img is not None and img.shape != (3, 224, 224):
+            if img.shape != (3, 224, 224):
                 raise ValueError(f"Sample {i}: Invalid image shape {img.shape}, expected (3, 224, 224)")
 
     # Stack tensors
     saliency_batch = torch.stack(saliencies, dim=0)  # [B, 1, H, W]
     label_batch = torch.tensor(labels, dtype=torch.long)  # [B]
 
-    if images[0] is not None:
-        image_batch = torch.stack([img for img in images if img is not None], dim=0)  # [B, 3, H, W]
+    # Only create image batch if ALL images are non-None
+    if not has_any_none and images[0] is not None:
+        image_batch = torch.stack(images, dim=0)  # [B, 3, H, W]
     else:
+        if has_any_none and images[0] is not None:
+            # Count how many are None
+            none_count = sum(1 for img in images if img is None)
+            print(f"⚠️  Warning: Batch has {none_count}/{len(images)} None images - skipping RGB data for this batch")
         image_batch = None
 
     # Final validation
