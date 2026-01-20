@@ -519,7 +519,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     @torch.no_grad()
     def _update_template_bank_ot(self, h_aligned, class_ids, cluster_assigned,
-                                  sparsity_percentile=90, top_k_percent=5):
+                                  sparsity_percentile=95, top_k_percent=3):
         """
         Update template bank using Optimal Transport (Sinkhorn barycenter) with AGGRESSIVE top-K sharpening.
 
@@ -607,7 +607,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             del barycenter, barycenter_flat, top_k_values, top_k_indices, barycenter_sharp
 
     @torch.no_grad()
-    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=90):
+    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=95):
         """Fallback: Running average update with v2 aggressive sparsity (98th percentile)."""
         B = h_aligned.shape[0]
 
@@ -1149,7 +1149,7 @@ class AdvancedLDDMMTrainer:
             lambda_mass_conservation=1.0,       # CRITICAL: Perfect mass conservation
             lambda_sparsity_match=10.0,           # CRITICAL: Preserve sparsity patterns
             lambda_tv=0.5,                        # Reduce fragmentation
-            lambda_jacobian=100.0,                 # CRITICAL: Prevent spatial stretching/compression!
+            lambda_jacobian=75.0,                 # CRITICAL: Prevent spatial stretching/compression!
             lambda_coarse_smooth=0.03             # V2: Reduced (0.05 → 0.03) for coarse field
         ).to(device)
 
