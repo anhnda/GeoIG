@@ -148,8 +148,15 @@ class PatternVisualizer:
                 v_res=v_res
             ).to(device)
 
-        # Load weights
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load weights (handle torch.compile() prefix)
+        state_dict = checkpoint['model_state_dict']
+
+        # Strip _orig_mod. prefix if present (from torch.compile())
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            print("  Detected torch.compile() checkpoint - stripping _orig_mod. prefix...")
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+        self.model.load_state_dict(state_dict)
         self.model.eval()
 
         # Templates are already in the model's buffers from state_dict
