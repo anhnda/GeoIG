@@ -837,16 +837,45 @@ class SaliencyMapDataset(Dataset):
         self.labels = []
         class_counts = defaultdict(int)
 
+        # Validation counters
+        corrupted_samples = 0
+
         for batch_file in tqdm(batch_files, desc="Building index"):
             batch_data = joblib.load(batch_file)
 
             for item_idx, item in enumerate(batch_data):
                 label = item['true_label']
 
+                # Validate saliency map exists and has correct shape
+                if 'saliency_map' not in item:
+                    print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - missing saliency_map")
+                    corrupted_samples += 1
+                    continue
+
+                saliency_shape = item['saliency_map'].shape
+                if len(saliency_shape) < 2 or saliency_shape[-2:] != (224, 224):
+                    print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - invalid shape {saliency_shape}")
+                    corrupted_samples += 1
+                    continue
+
+                # Validate RGB image if needed
+                if load_images and 'rgb_image' in item:
+                    rgb_shape = item['rgb_image'].shape
+                    if len(rgb_shape) != 3 or 3 not in rgb_shape:
+                        print(f"WARNING: Invalid RGB shape {rgb_shape} in {batch_file.name}, item {item_idx}")
+
                 if max_samples_per_class is None or class_counts[label] < max_samples_per_class:
                     self.sample_index.append((str(batch_file), item_idx))
                     self.labels.append(label)
                     class_counts[label] += 1
+
+            # Free memory after processing each batch
+            del batch_data
+            if batch_file == batch_files[0]:  # Only after first batch
+                gc.collect()
+
+        if corrupted_samples > 0:
+            print(f"⚠️  Skipped {corrupted_samples} corrupted samples during indexing")
 
         self.labels = torch.tensor(self.labels, dtype=torch.long)
 
@@ -904,25 +933,70 @@ class SaliencyMapDataset(Dataset):
         item = batch_data[item_idx]
 
         # Convert saliency map to tensor
-        saliency = torch.from_numpy(item['saliency_map']).float().unsqueeze(0)  # [1, H, W]
+        # Expected: item['saliency_map'] has shape (H, W) = (224, 224)
+        saliency_np = item['saliency_map']
+
+        # Handle different possible input shapes
+        if len(saliency_np.shape) == 2:
+            # Shape is (H, W) -> add channel dimension -> (1, H, W)
+            saliency = torch.from_numpy(saliency_np).float().unsqueeze(0)
+        elif len(saliency_np.shape) == 3:
+            # Shape is already (C, H, W) or (H, W, C)
+            if saliency_np.shape[0] in [1, 3]:  # Likely (C, H, W)
+                saliency = torch.from_numpy(saliency_np).float()
+            else:  # Likely (H, W, C)
+                saliency = torch.from_numpy(saliency_np).float().permute(2, 0, 1)
+            # Ensure single channel
+            if saliency.shape[0] > 1:
+                saliency = saliency.mean(dim=0, keepdim=True)
+        else:
+            raise ValueError(f"Unexpected saliency map shape: {saliency_np.shape}")
 
         # Optionally load RGB image
         if self.load_images:
             if 'rgb_image' in item:
-                image = torch.from_numpy(item['rgb_image']).float()
+                image_np = item['rgb_image']
+
+                # Handle different possible RGB shapes
+                if len(image_np.shape) == 3:
+                    # Expected: (3, H, W)
+                    if image_np.shape[0] == 3:
+                        image = torch.from_numpy(image_np).float()
+                    elif image_np.shape[2] == 3:
+                        # Shape is (H, W, 3) -> transpose to (3, H, W)
+                        image = torch.from_numpy(image_np).float().permute(2, 0, 1)
+                    else:
+                        raise ValueError(f"Unexpected RGB image shape: {image_np.shape}")
+                else:
+                    raise ValueError(f"RGB image should be 3D, got shape: {image_np.shape}")
+
                 # Normalize to [0, 1] if needed
                 if image.max() > 1.0:
                     image = image / 255.0
             elif 'image' in item:
-                image = torch.from_numpy(item['image']).float()
+                image_np = item['image']
+                image = torch.from_numpy(image_np).float()
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    image = image.permute(2, 0, 1)
                 if image.max() > 1.0:
                     image = image / 255.0
             else:
-                # Fallback: create dummy RGB from saliency
-                image = torch.from_numpy(np.stack([item['saliency_map']] * 3, axis=0)).float()
+                # Fallback: create dummy RGB from saliency (remove channel dim for stacking)
+                saliency_2d = saliency.squeeze(0).numpy()
+                image = torch.from_numpy(np.stack([saliency_2d] * 3, axis=0)).float()
+
+            # Validate output shapes
+            assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
+            assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
+            assert image.shape[0] == 3, f"Image should have 3 channels, got {image.shape}"
+            assert image.shape[1:] == (224, 224), f"Image should be 224x224, got {image.shape}"
 
             return saliency, label, image
         else:
+            # Validate output shape
+            assert saliency.shape[0] == 1, f"Saliency should have 1 channel, got {saliency.shape}"
+            assert saliency.shape[1:] == (224, 224), f"Saliency should be 224x224, got {saliency.shape}"
+
             return saliency, label, None
 
 
