@@ -918,7 +918,7 @@ class SaliencyMapDataset(Dataset):
     to balance between disk I/O and memory usage.
     """
 
-    def __init__(self, data_dir, max_samples_per_class=None, load_images=False, cache_size=10):
+    def __init__(self, data_dir, max_samples_per_class=None, load_images=False, cache_size=99999):
         self.data_dir = Path(data_dir)
         self.saliency_dir = self.data_dir / "saliency_maps"
         self.load_images = load_images
@@ -984,9 +984,11 @@ class SaliencyMapDataset(Dataset):
         num_samples = len(self.sample_index)
         saliency_size_mb = num_samples * 1 * 224 * 224 * 4 / (1024**2)
 
-        print(f"\n✓ Indexed {num_samples} samples (LAZY LOADING)")
+        num_batch_files = len(batch_files)
+        cache_mode = "ALL BATCHES CACHED" if cache_size >= num_batch_files else f"LRU CACHE ({cache_size} batches)"
+        print(f"\n✓ Indexed {num_samples} samples ({cache_mode})")
         print(f"  Index memory: ~{len(self.sample_index) * 64 / (1024**2):.1f} MB")
-        print(f"  Batch cache size: {cache_size} batches")
+        print(f"  Batch cache size: {cache_size} / {num_batch_files} batches")
 
         if load_images:
             images_size_mb = num_samples * 3 * 224 * 224 * 4 / (1024**2)
@@ -1437,8 +1439,8 @@ RECOMMENDED USAGE:
                        help='Max samples per class (default: None = all)')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_v2',
                        help='Checkpoint directory (default: ./checkpoints_v2)')
-    parser.add_argument('--cache_size', type=int, default=10,
-                       help='Number of batch files to cache in memory (default: 10, ~1-2GB per batch)')
+    parser.add_argument('--cache_size', type=int, default=99999,
+                       help='Number of batch files to cache in memory (default: 99999 = cache all, use low value only if RAM limited)')
 
     args = parser.parse_args()
 
@@ -1473,14 +1475,15 @@ RECOMMENDED USAGE:
         cache_size=args.cache_size  # Number of batch files to cache
     )
 
-    # DataLoader (lazy loading with LRU cache)
+    # DataLoader with parallel loading
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Keep 0 for lazy loading to avoid pickling issues
+        num_workers=4,  # Parallel data loading for better throughput
         pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=safe_collate_fn  # Custom collate to catch shape errors
+        collate_fn=safe_collate_fn,  # Custom collate to catch shape errors
+        persistent_workers=True  # Keep workers alive between epochs
     )
 
     print(f"\nDataLoader Configuration:")
