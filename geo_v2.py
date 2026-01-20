@@ -924,15 +924,15 @@ def safe_collate_fn(batch):
 
 class SaliencyMapDataset(Dataset):
     """
-    Fast dataset that loads ALL saliency maps into RAM during initialization.
-    RGB images are lazy-loaded on-demand to save memory.
+    Optimized dataset that loads ALL data into RAM during initialization.
+    - Saliency maps: float32 (1 channel)
+    - RGB images: uint8 (3 channels) - 75% memory savings vs float32
     """
 
-    def __init__(self, data_dir, max_samples_per_class=None, load_images=False, cache_size=5):
+    def __init__(self, data_dir, max_samples_per_class=None, load_images=False):
         self.data_dir = Path(data_dir)
         self.saliency_dir = self.data_dir / "saliency_maps"
         self.load_images = load_images
-        self.cache_size = cache_size  # Number of batch files to keep in cache (for RGB images)
 
         metadata_path = self.data_dir / "metadata.pkl"
         if not metadata_path.exists():
@@ -941,177 +941,143 @@ class SaliencyMapDataset(Dataset):
         self.metadata = joblib.load(metadata_path)
 
         batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
-        print(f"Loading {len(batch_files)} batch files - Saliency maps INTO RAM, RGB lazy-loaded...")
+        print(f"Pre-loading {len(batch_files)} batch files into RAM...")
+        print(f"  Saliency: float32, RGB: {'uint8 (4x memory efficient)' if load_images else 'not loaded'}")
 
-        # Store ALL saliency maps in RAM
-        self.saliency_maps = []  # List of tensors
-        self.labels = []
-
-        # For lazy RGB loading: store (batch_file, item_idx)
-        self.rgb_index = []  # [(batch_file, item_idx), ...] for lazy RGB loading
-
+        # First pass: count total samples
+        print("Counting samples...")
+        temp_samples = []
         class_counts = defaultdict(int)
 
-        # Validation counters
+        # First pass: count valid samples
         corrupted_samples = 0
-
-        for batch_file in tqdm(batch_files, desc="Loading saliency maps into RAM"):
+        for batch_file in tqdm(batch_files, desc="Counting samples"):
             batch_data = joblib.load(batch_file)
 
             for item_idx, item in enumerate(batch_data):
                 label = item['true_label']
 
-                # Validate saliency map exists and has correct shape
+                # Basic validation
                 if 'saliency_map' not in item:
-                    print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - missing saliency_map")
                     corrupted_samples += 1
                     continue
 
-                saliency_np = item['saliency_map']
-                saliency_shape = saliency_np.shape
-                if len(saliency_shape) < 2 or saliency_shape[-2:] != (224, 224):
-                    print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - invalid shape {saliency_shape}")
+                saliency_shape = item['saliency_map'].shape
+                if len(saliency_shape) < 2 or saliency_shape[-2:] != (224, 224) or 0 in saliency_shape:
                     corrupted_samples += 1
                     continue
 
-                # Check for corrupted data
-                if 0 in saliency_shape:
-                    print(f"WARNING: Skipping item {item_idx} in {batch_file.name} - corrupted shape {saliency_shape}")
+                if load_images and 'rgb_image' not in item:
                     corrupted_samples += 1
                     continue
-
-                # Validate RGB image if needed
-                if load_images and 'rgb_image' in item:
-                    rgb_shape = item['rgb_image'].shape
-                    if len(rgb_shape) != 3 or 3 not in rgb_shape:
-                        print(f"WARNING: Invalid RGB shape {rgb_shape} in {batch_file.name}, item {item_idx}")
 
                 if max_samples_per_class is None or class_counts[label] < max_samples_per_class:
-                    # Convert saliency map to tensor and store in RAM
-                    if len(saliency_shape) == 2:
-                        saliency_tensor = torch.from_numpy(saliency_np).float().unsqueeze(0)  # (1, H, W)
-                    elif len(saliency_shape) == 3:
-                        if saliency_np.shape[0] in [1, 3]:
-                            saliency_tensor = torch.from_numpy(saliency_np).float()
-                        else:
-                            saliency_tensor = torch.from_numpy(saliency_np).float().permute(2, 0, 1)
-                        if saliency_tensor.shape[0] > 1:
-                            saliency_tensor = saliency_tensor.mean(dim=0, keepdim=True)
-                    else:
-                        print(f"WARNING: Skipping item {item_idx} - unexpected shape {saliency_shape}")
-                        corrupted_samples += 1
-                        continue
-
-                    # Verify tensor has correct shape
-                    if saliency_tensor.shape[0] != 1 or saliency_tensor.shape[1:] != (224, 224):
-                        print(f"WARNING: Skipping item {item_idx} - bad tensor shape {saliency_tensor.shape}")
-                        corrupted_samples += 1
-                        continue
-
-                    self.saliency_maps.append(saliency_tensor)
-                    self.labels.append(label)
-                    self.rgb_index.append((str(batch_file), item_idx))
+                    temp_samples.append((batch_file, item_idx, label))
                     class_counts[label] += 1
 
-            # Free batch data memory
             del batch_data
             gc.collect()
 
-        if corrupted_samples > 0:
-            print(f"⚠️  Skipped {corrupted_samples} corrupted samples during loading")
+        num_samples = len(temp_samples)
+        print(f"Found {num_samples} valid samples ({corrupted_samples} corrupted)")
 
-        self.labels = torch.tensor(self.labels, dtype=torch.long)
-
-        # Calculate memory usage
-        num_samples = len(self.saliency_maps)
-        saliency_size_mb = num_samples * 1 * 224 * 224 * 4 / (1024**2)
-
-        print(f"\n✅ Loaded {num_samples} saliency maps into RAM")
-        print(f"   Saliency memory: ~{saliency_size_mb:.1f} MB")
+        # Pre-allocate tensors in RAM
+        print(f"Allocating tensors in RAM...")
+        self.saliency_maps = torch.zeros((num_samples, 1, 224, 224), dtype=torch.float32)
+        self.labels = torch.zeros(num_samples, dtype=torch.long)
 
         if load_images:
-            images_size_mb = num_samples * 3 * 224 * 224 * 4 / (1024**2)
-            num_batch_files = len(batch_files)
-            cache_mode = "ALL CACHED" if cache_size >= num_batch_files else f"LRU {cache_size}"
-            print(f"   RGB images: Lazy-loaded ({cache_mode})")
-            print(f"   RGB memory if fully loaded: ~{images_size_mb:.1f} MB (NOT loaded)")
-            # Create LRU cached batch loader for RGB images only
-            self._load_batch_cached = lru_cache(maxsize=cache_size)(self._load_batch_uncached)
+            # Store RGB as uint8 to save 75% memory
+            self.rgb_images = torch.zeros((num_samples, 3, 224, 224), dtype=torch.uint8)
         else:
-            print(f"   RGB images: Not used")
+            self.rgb_images = None
 
-    def _load_batch_uncached(self, batch_file):
-        """Load a batch file from disk (uncached)."""
-        return joblib.load(batch_file)
+        saliency_mb = num_samples * 1 * 224 * 224 * 4 / (1024**2)
+        rgb_mb = num_samples * 3 * 224 * 224 * 1 / (1024**2) if load_images else 0
+        print(f"  Saliency: {saliency_mb:.1f} MB (float32)")
+        if load_images:
+            print(f"  RGB: {rgb_mb:.1f} MB (uint8) - would be {rgb_mb*4:.1f} MB as float32")
+        print(f"  Total: {saliency_mb + rgb_mb:.1f} MB")
 
-    def clear_cache(self):
-        """Clear the LRU cache to free memory between epochs."""
-        if hasattr(self, '_load_batch_cached'):
-            self._load_batch_cached.cache_clear()
+        # Second pass: load data into pre-allocated tensors
+        print(f"Loading data into RAM...")
+        current_batch_file = None
+        batch_data = None
+
+        for idx, (batch_file, item_idx, label) in enumerate(tqdm(temp_samples, desc="Loading into RAM")):
+            # Load batch file if different from previous
+            if batch_file != current_batch_file:
+                if batch_data is not None:
+                    del batch_data
+                batch_data = joblib.load(batch_file)
+                current_batch_file = batch_file
+
+            item = batch_data[item_idx]
+
+            # Load saliency
+            saliency_np = item['saliency_map']
+            if len(saliency_np.shape) == 2:
+                saliency_tensor = torch.from_numpy(saliency_np).float().unsqueeze(0)
+            elif len(saliency_np.shape) == 3:
+                if saliency_np.shape[0] in [1, 3]:
+                    saliency_tensor = torch.from_numpy(saliency_np).float()
+                else:
+                    saliency_tensor = torch.from_numpy(saliency_np).float().permute(2, 0, 1)
+                if saliency_tensor.shape[0] > 1:
+                    saliency_tensor = saliency_tensor.mean(dim=0, keepdim=True)
+
+            self.saliency_maps[idx] = saliency_tensor
+            self.labels[idx] = label
+
+            # Load RGB if needed
+            if load_images:
+                rgb_np = item['rgb_image']
+
+                # Convert to (3, 224, 224) format
+                if len(rgb_np.shape) == 3:
+                    if rgb_np.shape[0] == 3:
+                        rgb_tensor = rgb_np  # Already (3, H, W)
+                    elif rgb_np.shape[2] == 3:
+                        rgb_tensor = rgb_np.transpose(2, 0, 1)  # (H, W, 3) -> (3, H, W)
+                    else:
+                        raise ValueError(f"Unexpected RGB shape: {rgb_np.shape}")
+                else:
+                    raise ValueError(f"RGB should be 3D, got {rgb_np.shape}")
+
+                # Convert to uint8 (0-255 range)
+                if rgb_tensor.max() <= 1.0:
+                    rgb_tensor = (rgb_tensor * 255).astype(np.uint8)
+                else:
+                    rgb_tensor = rgb_tensor.astype(np.uint8)
+
+                self.rgb_images[idx] = torch.from_numpy(rgb_tensor)
+
+        # Free temporary data
+        if batch_data is not None:
+            del batch_data
+        del temp_samples
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
-    def get_cache_info(self):
-        """Get cache statistics."""
-        if hasattr(self, '_load_batch_cached'):
-            return self._load_batch_cached.cache_info()
-        return None
+        print(f"\n✅ Successfully loaded {num_samples} samples into RAM")
+        if corrupted_samples > 0:
+            print(f"⚠️  Skipped {corrupted_samples} corrupted samples")
 
     def __len__(self):
         return len(self.saliency_maps)
 
     def __getitem__(self, idx):
         """
-        Fast access: saliency maps are pre-loaded, RGB images are lazy-loaded.
+        Ultra-fast access: everything is pre-loaded in RAM.
+        RGB stored as uint8, converted to float32 on-the-fly (very fast).
         """
-        # Get pre-loaded saliency map (already a tensor in RAM)
+        # Get saliency (already float32)
         saliency = self.saliency_maps[idx]
-        label = self.labels[idx]
+        label = self.labels[idx].item()
 
-        # Optionally lazy-load RGB image from disk
+        # Get RGB if needed
         if self.load_images:
-            try:
-                batch_file, item_idx = self.rgb_index[idx]
-
-                # Load batch from cache (or disk if not cached)
-                batch_data = self._load_batch_cached(batch_file)
-                item = batch_data[item_idx]
-
-                if 'rgb_image' in item:
-                    image_np = item['rgb_image']
-
-                    # Handle different possible RGB shapes
-                    if len(image_np.shape) == 3:
-                        if image_np.shape[0] == 3:
-                            image = torch.from_numpy(image_np).float()
-                        elif image_np.shape[2] == 3:
-                            image = torch.from_numpy(image_np).float().permute(2, 0, 1)
-                        else:
-                            raise ValueError(f"Unexpected RGB image shape: {image_np.shape}")
-                    else:
-                        raise ValueError(f"RGB image should be 3D, got shape: {image_np.shape}")
-
-                    # Normalize to [0, 1] if needed
-                    if image.max() > 1.0:
-                        image = image / 255.0
-                elif 'image' in item:
-                    image_np = item['image']
-                    image = torch.from_numpy(image_np).float()
-                    if len(image.shape) == 3 and image.shape[2] == 3:
-                        image = image.permute(2, 0, 1)
-                    if image.max() > 1.0:
-                        image = image / 255.0
-                else:
-                    # Fallback: create dummy RGB from saliency
-                    saliency_2d = saliency.squeeze(0)
-                    image = saliency_2d.repeat(3, 1, 1)
-            except Exception as e:
-                print(f"\n⚠️  Warning: Failed to load RGB for sample {idx}: {e}")
-                # Fallback to dummy RGB
-                saliency_2d = saliency.squeeze(0)
-                image = saliency_2d.repeat(3, 1, 1)
-
+            # Convert uint8 -> float32 on-the-fly (happens in worker thread, very fast)
+            image = self.rgb_images[idx].float() / 255.0  # (3, 224, 224)
             return saliency, label, image
         else:
             return saliency, label, None
@@ -1233,7 +1199,7 @@ class AdvancedLDDMMTrainer:
                 epoch_losses[key] += value.item()
             num_batches += 1
 
-            # Update progress bar with cache stats
+            # Update progress bar
             postfix_dict = {
                 'loss': losses['total'].item(),
                 'align': losses['alignment'].item(),
@@ -1241,13 +1207,6 @@ class AdvancedLDDMMTrainer:
             if torch.cuda.is_available():
                 gpu_mem_used = torch.cuda.memory_allocated() / (1024**3)
                 postfix_dict['GPU_GB'] = f'{gpu_mem_used:.1f}'
-
-            # Add cache hit rate if available
-            if hasattr(self.train_loader.dataset, 'get_cache_info'):
-                cache_info = self.train_loader.dataset.get_cache_info()
-                if cache_info:
-                    hit_rate = cache_info.hits / (cache_info.hits + cache_info.misses) * 100 if (cache_info.hits + cache_info.misses) > 0 else 0
-                    postfix_dict['cache%'] = f'{hit_rate:.0f}'
 
             pbar.set_postfix(postfix_dict)
 
@@ -1266,19 +1225,10 @@ class AdvancedLDDMMTrainer:
         for key, value in avg_losses.items():
             self.history[f'train_{key}'].append(value)
 
-        # Clear dataset cache at end of epoch to free memory
-        if hasattr(self.train_loader.dataset, 'clear_cache'):
-            print(f"\n  Clearing dataset cache...")
-            cache_info = self.train_loader.dataset.get_cache_info()
-            if cache_info:
-                print(f"    Cache stats: hits={cache_info.hits}, misses={cache_info.misses}, "
-                      f"size={cache_info.currsize}/{cache_info.maxsize}")
-            self.train_loader.dataset.clear_cache()
-
-            # Also run garbage collection
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        # Run garbage collection at end of epoch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return avg_losses
 
@@ -1409,9 +1359,6 @@ RECOMMENDED USAGE:
                        help='Max samples per class (default: None = all)')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_v2',
                        help='Checkpoint directory (default: ./checkpoints_v2)')
-    parser.add_argument('--cache_size', type=int, default=5,
-                       help='Number of RGB batch files to cache in memory (default: 5, increase if you have RAM)')
-
     args = parser.parse_args()
 
     # Setup
@@ -1443,25 +1390,25 @@ RECOMMENDED USAGE:
     dataset = SaliencyMapDataset(
         data_dir=args.data_dir,
         max_samples_per_class=args.max_samples_per_class,
-        load_images=args.use_edge_gating,  # Load RGB images only if edge gating is enabled
-        cache_size=args.cache_size  # Number of batch files to cache
+        load_images=args.use_edge_gating  # Load RGB images into RAM (uint8 format)
     )
 
-    # DataLoader - use 0 workers to avoid RAM duplication across processes
+    # DataLoader - use multiple workers for fast data loading (data is in RAM)
     train_loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Single process to save RAM (multiprocessing duplicates data)
+        num_workers=4,  # Parallel workers can efficiently access RAM
         pin_memory=True if torch.cuda.is_available() else False,
-        collate_fn=safe_collate_fn  # Custom collate to catch shape errors
+        collate_fn=safe_collate_fn,  # Custom collate to catch shape errors
+        persistent_workers=True  # Keep workers alive between batches
     )
 
     print(f"\nDataLoader Configuration:")
     print(f"  Batch size: {args.batch_size}")
-    print(f"  Num workers: 0 (lazy loading dataset)")
+    print(f"  Num workers: 4 (parallel loading from RAM)")
     print(f"  Pin memory: {True if torch.cuda.is_available() else False}")
-    print(f"  Cache size: {args.cache_size} batches")
+    print(f"  Persistent workers: True")
 
     # Create model
     print(f"\nInitializing Advanced LDDMM model...")
