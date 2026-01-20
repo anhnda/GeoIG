@@ -654,7 +654,7 @@ class AdvancedLDDMMLoss(nn.Module):
 
     def __init__(self, lambda_smooth=0.02, lambda_entropy=1.0, lambda_magnitude=0.00005,
                  lambda_diversity=2.0, lambda_template_diversity=2.0, lambda_template_sparsity=5.0,
-                 lambda_spatial_diversity=0.3, lambda_compactness=10.0, lambda_mass_conservation=100.0,
+                 lambda_spatial_diversity=0.3, lambda_compactness=10.0, lambda_mass_conservation=0.01,
                  lambda_sparsity_match=10.0, lambda_tv=0.5, lambda_jacobian=50.0,
                  lambda_coarse_smooth=0.03):  # V2: Reduced smoothness for anti-diffusion
         super().__init__()
