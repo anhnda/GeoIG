@@ -1361,8 +1361,8 @@ RECOMMENDED USAGE:
                        help='Number of sub-patterns per class (default: 10)')
     parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs (default: 50)')
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size (default: 32)')
+    parser.add_argument('--batch_size', type=int, default=64,
+                       help='Batch size (default: 64)')
     parser.add_argument('--lr', type=float, default=1e-3,
                        help='Learning rate (default: 1e-3)')
     parser.add_argument('--use_ot', action='store_true',
@@ -1438,7 +1438,7 @@ RECOMMENDED USAGE:
         use_ot=args.use_ot,
         use_edge_gating=args.use_edge_gating
     )
-
+    model = torch.compile(model) # Add this line
     # Create trainer
     trainer = AdvancedLDDMMTrainer(
         model=model,
