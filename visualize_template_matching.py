@@ -28,6 +28,7 @@ from matplotlib.gridspec import GridSpec
 from pathlib import Path
 import argparse
 import joblib
+from torchvision import transforms
 
 # Import model components
 import sys
@@ -119,6 +120,17 @@ class TemplateMatchingVisualizer:
 
         print(f"✓ Model loaded successfully!")
 
+        # ImageNet normalization parameters
+        self.mean = np.array([0.485, 0.456, 0.406])
+        self.std = np.array([0.229, 0.224, 0.225])
+
+        # Transform for loading ImageNet images
+        self.image_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+
         # Load ImageNet dataset
         print(f"\nLoading ImageNet dataset...")
         try:
@@ -186,6 +198,30 @@ class TemplateMatchingVisualizer:
                 class_samples.append(sample_dict)
 
         return class_samples
+
+    def get_original_image(self, sample):
+        """
+        Get original image from sample.
+
+        Args:
+            sample: Sample dictionary
+
+        Returns:
+            (H, W, 3) RGB image in [0, 1] range, or None if not available
+        """
+        if 'sample_index' in sample and self.imagenet_dataset is not None:
+            try:
+                sample_idx = sample['sample_index']
+                image_pil, _ = self.imagenet_dataset[sample_idx]
+                # Transform to tensor and convert to numpy array
+                img_tensor = self.image_transform(image_pil).numpy()
+                # Convert from CHW to HWC and ensure [0, 1] range
+                img_array = img_tensor.transpose(1, 2, 0)
+                return img_array
+            except Exception as e:
+                print(f"Warning: Could not load image from dataset index {sample.get('sample_index')}: {e}")
+
+        return None
 
     def plot_grid_deformation(self, phi, img_res=(224, 224), grid_spacing=16, title="Grid Deformation"):
         """
@@ -266,18 +302,22 @@ class TemplateMatchingVisualizer:
         saliency_map = sample['saliency_map']
         confidence = sample['confidence']
 
+        # Get original image
+        original_image = self.get_original_image(sample)
+        has_original_image = original_image is not None
+
         # Convert to tensor
         h_i = torch.from_numpy(saliency_map).float().unsqueeze(0).unsqueeze(0).to(self.device)
 
         # Forward pass
         with torch.no_grad():
             if self.is_advanced_model:
-                h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine = self.model(
+                h_aligned, cluster_probs, phi_coarse, phi_fine, _, _ = self.model(
                     h_i, update_templates=False
                 )
                 cluster_assigned = torch.argmax(cluster_probs, dim=-1).item()
             else:
-                h_aligned, cluster_probs, phi, v = self.model(h_i, update_templates=False)
+                h_aligned, cluster_probs, phi, _ = self.model(h_i, update_templates=False)
                 cluster_assigned = torch.argmax(cluster_probs, dim=-1).item()
                 # For simple model, treat as single-scale
                 phi_coarse = phi * 0  # No coarse component
@@ -291,16 +331,28 @@ class TemplateMatchingVisualizer:
         matched_template = templates[cluster_assigned, 0]
 
         # Create comprehensive figure
-        fig = plt.figure(figsize=(20, 12))
-        gs = GridSpec(3, 5, figure=fig, hspace=0.3, wspace=0.3)
+        # Adjust layout based on whether we have original image
+        num_cols = 6 if has_original_image else 5
+        fig = plt.figure(figsize=(4*num_cols, 12))
+        gs = GridSpec(3, num_cols, figure=fig, hspace=0.3, wspace=0.3)
 
         # Title
         fig.suptitle(f'Template Matching Visualization: {class_name} (Class {class_id})\n'
                     f'Sample {sample_idx} | Matched to Pattern {cluster_assigned} | Confidence: {confidence:.3f}',
                     fontsize=16, fontweight='bold')
 
-        # Row 1: Original, Deformations, Aligned
-        ax1 = fig.add_subplot(gs[0, 0])
+        col_offset = 0
+
+        # Original Image (if available)
+        if has_original_image:
+            ax0 = fig.add_subplot(gs[0, 0])
+            ax0.imshow(original_image)
+            ax0.set_title('Original Image', fontsize=11, fontweight='bold')
+            ax0.axis('off')
+            col_offset = 1
+
+        # Row 1: Original IG, Deformations, Aligned
+        ax1 = fig.add_subplot(gs[0, col_offset])
         im1 = ax1.imshow(h_i_np, cmap='hot', interpolation='bilinear')
         ax1.set_title('Original IG Map', fontsize=11, fontweight='bold')
         ax1.axis('off')
@@ -309,21 +361,21 @@ class TemplateMatchingVisualizer:
         # Grid deformations
         if self.is_advanced_model:
             # Coarse deformation
-            ax2 = fig.add_subplot(gs[0, 1])
+            ax2 = fig.add_subplot(gs[0, col_offset+1])
             grid_coarse = self._create_grid_deformation_image(phi_coarse, grid_spacing)
             ax2.imshow(grid_coarse, cmap='gray')
             ax2.set_title('Coarse Deformation\n(Global Alignment)', fontsize=10, fontweight='bold')
             ax2.axis('off')
 
             # Fine deformation
-            ax3 = fig.add_subplot(gs[0, 2])
+            ax3 = fig.add_subplot(gs[0, col_offset+2])
             grid_fine = self._create_grid_deformation_image(phi_fine, grid_spacing)
             ax3.imshow(grid_fine, cmap='gray')
             ax3.set_title('Fine Deformation\n(Local Refinement)', fontsize=10, fontweight='bold')
             ax3.axis('off')
 
             # Combined deformation
-            ax4 = fig.add_subplot(gs[0, 3])
+            ax4 = fig.add_subplot(gs[0, col_offset+3])
             phi_combined = phi_coarse + phi_fine
             grid_combined = self._create_grid_deformation_image(phi_combined, grid_spacing)
             ax4.imshow(grid_combined, cmap='gray')
@@ -331,14 +383,14 @@ class TemplateMatchingVisualizer:
             ax4.axis('off')
         else:
             # Single-scale deformation
-            ax_single = fig.add_subplot(gs[0, 1:4])
+            ax_single = fig.add_subplot(gs[0, col_offset+1:col_offset+4])
             grid_single = self._create_grid_deformation_image(phi_fine, grid_spacing)
             ax_single.imshow(grid_single, cmap='gray')
             ax_single.set_title('Deformation Field\n(Single-Scale)', fontsize=11, fontweight='bold')
             ax_single.axis('off')
 
         # Aligned result
-        ax5 = fig.add_subplot(gs[0, 4])
+        ax5 = fig.add_subplot(gs[0, col_offset+4])
         im5 = ax5.imshow(h_aligned_np, cmap='hot', interpolation='bilinear')
         ax5.set_title('Aligned IG Map', fontsize=11, fontweight='bold')
         ax5.axis('off')
@@ -349,14 +401,25 @@ class TemplateMatchingVisualizer:
         phi_total = phi_coarse + phi_fine
         deform_mag = torch.sqrt(phi_total[:, 0]**2 + phi_total[:, 1]**2).squeeze().cpu().numpy()
 
-        ax6 = fig.add_subplot(gs[1, 0])
+        # Show original image with saliency overlay if available
+        row2_start = 0
+        if has_original_image:
+            ax_overlay = fig.add_subplot(gs[1, 0])
+            # Create overlay: original image with saliency heatmap
+            ax_overlay.imshow(original_image)
+            ax_overlay.imshow(h_i_np, cmap='hot', alpha=0.5, interpolation='bilinear')
+            ax_overlay.set_title('Image + Saliency\nOverlay', fontsize=11, fontweight='bold')
+            ax_overlay.axis('off')
+            row2_start = 1
+
+        ax6 = fig.add_subplot(gs[1, row2_start])
         im6 = ax6.imshow(deform_mag, cmap='viridis', interpolation='bilinear')
         ax6.set_title('Deformation Magnitude', fontsize=11, fontweight='bold')
         ax6.axis('off')
         plt.colorbar(im6, ax=ax6, fraction=0.046)
 
         # Deformation direction (quiver plot)
-        ax7 = fig.add_subplot(gs[1, 1:3])
+        ax7 = fig.add_subplot(gs[1, row2_start+1:row2_start+3])
         ax7.imshow(h_i_np, cmap='gray', alpha=0.3, interpolation='bilinear')
 
         # Downsample for arrow visualization
@@ -374,14 +437,14 @@ class TemplateMatchingVisualizer:
         ax7.axis('off')
 
         # Matched template
-        ax8 = fig.add_subplot(gs[1, 3])
+        ax8 = fig.add_subplot(gs[1, row2_start+3])
         im8 = ax8.imshow(matched_template, cmap='hot', interpolation='bilinear')
         ax8.set_title(f'Matched Template\n(Pattern {cluster_assigned})', fontsize=11, fontweight='bold')
         ax8.axis('off')
         plt.colorbar(im8, ax=ax8, fraction=0.046)
 
         # Difference map
-        ax9 = fig.add_subplot(gs[1, 4])
+        ax9 = fig.add_subplot(gs[1, row2_start+4])
         diff = np.abs(h_aligned_np - matched_template)
         im9 = ax9.imshow(diff, cmap='RdYlGn_r', interpolation='bilinear')
         ax9.set_title(f'Alignment Error\nMSE: {np.mean(diff**2):.6f}', fontsize=11, fontweight='bold')
