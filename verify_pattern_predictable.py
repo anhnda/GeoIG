@@ -1,20 +1,24 @@
 """
 Pattern Predictability Verification for Geodesic LDDMM Model
 
-This script verifies that learned patterns are predictive by:
+This script verifies that learned patterns are predictive using Pattern-Injection:
 1. Loading the top patterns for a specific class
 2. Filtering out zero-usage patterns (0%)
-3. Converting patterns back to image space
-4. Feeding them to the model to verify correct predictions
-5. Outputting statistics on prediction accuracy
+3. Taking random images from DIFFERENT classes
+4. Injecting/overlaying the target class pattern onto these images
+5. Checking if the classifier's probability for the target class increases significantly
+
+This tests whether the patterns capture discriminative features that can shift
+predictions toward the target class.
 
 Usage:
-    # Verify patterns for class 0
+    # Verify patterns for class 0 (tabby cat)
     python verify_pattern_predictable.py --checkpoint checkpoints/lddmm_model_final.pth --class_id 0
 
-    # Verify specific class with custom data
-    python verify_pattern_predictable.py --checkpoint checkpoints/lddmm_model_epoch_10.pth \
+    # Verify with custom number of test images
+    python verify_pattern_predictable.py --checkpoint checkpoints/lddmm_model_final.pth \
                                           --class_id 281 \
+                                          --num_test_images 50 \
                                           --data_dir ./data/saliency_imagenet1k_resnet50_100
 """
 
@@ -24,7 +28,8 @@ import numpy as np
 from pathlib import Path
 import argparse
 from torchvision import models, transforms
-from PIL import Image
+import joblib
+import random
 
 # Import model components
 import sys
@@ -32,13 +37,15 @@ sys.path.append('.')
 from geo_patterns import LDDMM_GlobalPatternPipeline
 from geo_x import AdvancedLDDMM_Pipeline
 from full_classes import IMAGENET2012_CLASSES
+from saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
 
 
 class PatternPredictor:
-    """Verify pattern predictability by feeding them back to a classifier."""
+    """Verify pattern predictability using pattern injection on real images."""
 
-    def __init__(self, checkpoint_path, device='cuda'):
+    def __init__(self, checkpoint_path, data_dir, device='cuda', images_per_class=100):
         self.device = device
+        self.data_dir = Path(data_dir)
 
         # Load checkpoint
         print(f"Loading checkpoint from {checkpoint_path}...")
@@ -120,78 +127,171 @@ class PatternPredictor:
         self.classifier.eval()
         print(f"✓ ResNet50 loaded successfully!")
 
-        # ImageNet normalization
-        self.normalize = transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
+        # ImageNet normalization parameters
+        self.mean = np.array([0.485, 0.456, 0.406])
+        self.std = np.array([0.229, 0.224, 0.225])
+
+        # Transform for loading ImageNet images
+        self.image_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+        ])
+
+        # Normalization transform for classifier
+        self.normalize = transforms.Normalize(mean=self.mean.tolist(), std=self.std.tolist())
+
+        # Load ImageNet dataset for accessing original images
+        print(f"\nLoading ImageNet dataset for test images...")
+        try:
+            self.imagenet_dataset = ImageNet1kSaliencyDataset(
+                raw_dir=IMAGENET_RAW_DIR,
+                sampled_dir=IMAGENET_SAMPLED_DIR,
+                output_dir=self.data_dir,
+                images_per_class=images_per_class,
+                force_resample=False
+            )
+            print(f"✓ ImageNet dataset loaded with {len(self.imagenet_dataset)} images")
+        except Exception as e:
+            raise RuntimeError(f"Could not load ImageNet dataset: {e}")
+
+        # Build class index for fast sample lookup
+        self.saliency_dir = self.data_dir / "saliency_maps"
+        self.cache_file = self.data_dir / "class_index_cache.pkl"
+        print(f"\nLoading class index for sample lookup...")
+        self.class_index = self._load_index_cache()
+        print(f"✓ Class index ready!")
 
         # Get class names
-        self.class_names = {idx: name for idx, (wnid, name) in enumerate(IMAGENET2012_CLASSES.items())}
+        self.class_names = {idx: name for idx, name in enumerate(IMAGENET2012_CLASSES.values())}
 
-    def pattern_to_image(self, pattern):
+    def _load_index_cache(self):
+        """Load the class index from cache file."""
+        if not self.cache_file.exists():
+            raise RuntimeError(f"Class index cache not found at {self.cache_file}. "
+                             f"Please run visualize_patterns.py first to build the cache.")
+        print(f"  Loading index from cache...")
+        class_index = joblib.load(self.cache_file)
+        total_samples = sum(len(samples) for samples in class_index.values())
+        print(f"  ✓ Cache loaded: {len(class_index)} classes, {total_samples} samples")
+        return class_index
+
+    def get_random_images_from_other_classes(self, target_class_id, num_images=20):
         """
-        Convert a pattern (saliency map) back to image space.
-
-        This is a heuristic approach:
-        1. Normalize the pattern to [0, 1]
-        2. Convert from single channel to RGB by replicating
-        3. Apply smoothing to create more natural images
+        Get random images from classes OTHER than the target class.
 
         Args:
-            pattern: (1, H, W) pattern tensor
+            target_class_id: Class to exclude
+            num_images: Number of random images to retrieve
 
         Returns:
-            (3, H, W) image tensor in [0, 1] range
+            List of (image_tensor, original_class_id) tuples
         """
-        # Ensure pattern is on CPU for processing
-        pattern_cpu = pattern.squeeze().cpu()
+        # Get all class IDs except target
+        other_class_ids = [c for c in range(self.num_classes) if c != target_class_id]
 
-        # Normalize to [0, 1] range
-        pattern_min = pattern_cpu.min()
-        pattern_max = pattern_cpu.max()
+        # Sample random images
+        sampled_images = []
+        attempts = 0
+        max_attempts = num_images * 10
+
+        while len(sampled_images) < num_images and attempts < max_attempts:
+            attempts += 1
+
+            # Pick a random class
+            random_class = random.choice(other_class_ids)
+
+            # Get samples for this class
+            if random_class not in self.class_index or not self.class_index[random_class]:
+                continue
+
+            # Pick a random sample from this class
+            batch_file, item_idx = random.choice(self.class_index[random_class])
+
+            try:
+                # Load the batch
+                batch_data = joblib.load(batch_file)
+                item = batch_data[item_idx]
+
+                # Get the sample index
+                sample_idx = item.get('sample_index', item.get('index'))
+
+                # Load image from dataset
+                image_pil, label = self.imagenet_dataset[sample_idx]
+                img_tensor = self.image_transform(image_pil)  # (3, 224, 224)
+
+                sampled_images.append((img_tensor, random_class))
+
+            except Exception as e:
+                print(f"Warning: Could not load sample: {e}")
+                continue
+
+        return sampled_images
+
+    def inject_pattern_into_image(self, image, pattern, alpha=0.3, method='additive'):
+        """
+        Inject a pattern into an image.
+
+        Args:
+            image: (3, H, W) image tensor in [0, 1]
+            pattern: (1, H, W) pattern tensor
+            alpha: Strength of injection (0-1)
+            method: 'additive' or 'multiplicative'
+
+        Returns:
+            (3, H, W) modified image tensor
+        """
+        # Normalize pattern to [0, 1]
+        pattern_np = pattern.squeeze().cpu().numpy()
+        pattern_min = pattern_np.min()
+        pattern_max = pattern_np.max()
 
         if pattern_max > pattern_min:
-            pattern_norm = (pattern_cpu - pattern_min) / (pattern_max - pattern_min)
+            pattern_norm = (pattern_np - pattern_min) / (pattern_max - pattern_min)
         else:
-            pattern_norm = pattern_cpu
+            pattern_norm = np.ones_like(pattern_np) * 0.5
 
-        # Apply smoothing to make it more image-like
-        pattern_tensor = pattern_norm.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        # Convert to tensor and expand to 3 channels
+        pattern_tensor = torch.from_numpy(pattern_norm).float()
+        pattern_3ch = pattern_tensor.unsqueeze(0).repeat(3, 1, 1)  # (3, H, W)
 
-        # Gaussian blur for smoothing
-        kernel_size = 5
-        sigma = 1.0
-        kernel = self._gaussian_kernel(kernel_size, sigma).to(pattern_tensor.device)
-        pattern_smooth = F.conv2d(pattern_tensor, kernel, padding=kernel_size//2)
+        image_np = image.numpy()
 
-        # Convert to RGB by replicating the channel
-        pattern_rgb = pattern_smooth.repeat(1, 3, 1, 1)  # (1, 3, H, W)
+        if method == 'additive':
+            # Add pattern to image (weighted)
+            injected = image_np + alpha * pattern_3ch.numpy()
+            injected = np.clip(injected, 0, 1)
+        elif method == 'multiplicative':
+            # Multiply image by pattern (enhances where pattern is strong)
+            injected = image_np * (1 + alpha * pattern_3ch.numpy())
+            injected = np.clip(injected, 0, 1)
+        else:
+            raise ValueError(f"Unknown injection method: {method}")
 
-        return pattern_rgb.squeeze(0)  # (3, H, W)
+        return torch.from_numpy(injected).float()
 
-    def _gaussian_kernel(self, kernel_size, sigma):
-        """Create a 2D Gaussian kernel for smoothing."""
-        x = torch.arange(kernel_size).float() - kernel_size // 2
-        gauss = torch.exp(-x.pow(2) / (2 * sigma ** 2))
-        kernel = gauss.unsqueeze(0) * gauss.unsqueeze(1)
-        kernel = kernel / kernel.sum()
-        return kernel.unsqueeze(0).unsqueeze(0)  # (1, 1, K, K)
-
-    def verify_class_patterns(self, class_id, min_usage_threshold=0.0):
+    def verify_class_patterns(self, class_id, num_test_images=20, min_usage_threshold=0.0,
+                            alpha=0.3, injection_method='additive'):
         """
-        Verify that patterns for a class can be correctly predicted.
+        Verify that patterns for a class are predictive using pattern injection.
+
+        Takes random images from OTHER classes, injects the target class patterns,
+        and checks if the classifier's probability for the target class increases.
 
         Args:
             class_id: Class index to verify
+            num_test_images: Number of random test images from other classes
             min_usage_threshold: Minimum usage percentage to include (0.0 = exclude zero patterns)
+            alpha: Pattern injection strength (0-1)
+            injection_method: 'additive' or 'multiplicative'
 
         Returns:
-            dict: Results including correct predictions and statistics
+            dict: Results including probability changes and statistics
         """
         class_name = self.class_names.get(class_id, f"Class {class_id}")
         print(f"\n{'='*80}")
         print(f"Verifying patterns for: {class_name} (Class {class_id})")
+        print(f"Pattern Injection Method: {injection_method} (alpha={alpha})")
         print(f"{'='*80}")
 
         # Get templates and counts for this class
@@ -216,7 +316,7 @@ class PatternPredictor:
         print(f"\nPattern Statistics:")
         print(f"  Total patterns: {self.k_subpatterns}")
         print(f"  Patterns with usage > {min_usage_threshold}%: {len(valid_patterns)}")
-        print(f"  Filtered out: {self.k_subpatterns - len(valid_patterns)}")
+        print(f"  Filtered out (zero usage): {self.k_subpatterns - len(valid_patterns)}")
 
         if not valid_patterns:
             print(f"\n⚠ No patterns found with usage > {min_usage_threshold}%")
@@ -225,105 +325,152 @@ class PatternPredictor:
                 'class_name': class_name,
                 'total_patterns': self.k_subpatterns,
                 'tested_patterns': 0,
-                'correct_predictions': 0,
-                'accuracy': 0.0,
+                'successful_injections': 0,
                 'pattern_results': []
             }
 
+        # Get random test images from other classes
+        print(f"\n{'='*80}")
+        print(f"Sampling {num_test_images} random images from OTHER classes...")
+        print(f"{'='*80}")
+
+        test_images = self.get_random_images_from_other_classes(class_id, num_test_images)
+        print(f"✓ Sampled {len(test_images)} test images")
+
+        if not test_images:
+            print(f"\n⚠ Could not load test images")
+            return None
+
         # Test each valid pattern
         print(f"\n{'='*80}")
-        print(f"Testing patterns by feeding to classifier...")
+        print(f"Testing Pattern Injection...")
         print(f"{'='*80}")
 
         pattern_results = []
-        correct_count = 0
 
         with torch.no_grad():
-            for i, pattern_info in enumerate(valid_patterns):
+            for pattern_info in valid_patterns:
                 pattern_id = pattern_info['pattern_id']
                 pattern = pattern_info['template']
 
-                # Convert pattern to image
-                img = self.pattern_to_image(pattern).to(self.device)
+                print(f"\nPattern {pattern_id} (usage: {pattern_info['usage_percent']:.1f}%):")
 
-                # Normalize for classifier
-                img_normalized = self.normalize(img).unsqueeze(0)  # (1, 3, H, W)
+                prob_increases = []
+                rank_improvements = []
 
-                # Get prediction from classifier
-                logits = self.classifier(img_normalized)
-                pred_class = logits.argmax(dim=1).item()
-                pred_prob = F.softmax(logits, dim=1)[0, class_id].item()
-                top5_probs, top5_classes = torch.topk(F.softmax(logits, dim=1), k=5, dim=1)
+                for img_idx, (img_tensor, orig_class) in enumerate(test_images):
+                    # Get baseline prediction (without pattern)
+                    img_normalized = self.normalize(img_tensor).unsqueeze(0).to(self.device)
+                    baseline_logits = self.classifier(img_normalized)
+                    baseline_probs = F.softmax(baseline_logits, dim=1)[0]
+                    baseline_prob = baseline_probs[class_id].item()
 
-                is_correct = (pred_class == class_id)
-                is_in_top5 = class_id in top5_classes[0].cpu().numpy()
+                    # Get baseline rank of target class
+                    sorted_indices = torch.argsort(baseline_probs, descending=True)
+                    baseline_rank = (sorted_indices == class_id).nonzero(as_tuple=True)[0].item()
 
-                if is_correct:
-                    correct_count += 1
+                    # Inject pattern into image
+                    injected_img = self.inject_pattern_into_image(
+                        img_tensor, pattern, alpha=alpha, method=injection_method
+                    )
+
+                    # Get prediction with pattern
+                    injected_normalized = self.normalize(injected_img).unsqueeze(0).to(self.device)
+                    injected_logits = self.classifier(injected_normalized)
+                    injected_probs = F.softmax(injected_logits, dim=1)[0]
+                    injected_prob = injected_probs[class_id].item()
+
+                    # Get new rank of target class
+                    sorted_indices_inj = torch.argsort(injected_probs, descending=True)
+                    injected_rank = (sorted_indices_inj == class_id).nonzero(as_tuple=True)[0].item()
+
+                    # Calculate changes
+                    prob_increase = injected_prob - baseline_prob
+                    rank_improvement = baseline_rank - injected_rank  # Positive = better rank
+
+                    prob_increases.append(prob_increase)
+                    rank_improvements.append(rank_improvement)
+
+                # Calculate statistics for this pattern
+                avg_prob_increase = np.mean(prob_increases)
+                median_prob_increase = np.median(prob_increases)
+                positive_increases = sum(1 for x in prob_increases if x > 0)
+                avg_rank_improvement = np.mean(rank_improvements)
 
                 result = {
                     'pattern_id': pattern_id,
                     'usage_percent': pattern_info['usage_percent'],
-                    'predicted_class': pred_class,
-                    'predicted_class_name': self.class_names.get(pred_class, f"Class {pred_class}"),
-                    'target_class_prob': pred_prob,
-                    'is_correct': is_correct,
-                    'is_in_top5': is_in_top5,
-                    'top5_classes': top5_classes[0].cpu().numpy().tolist(),
-                    'top5_probs': top5_probs[0].cpu().numpy().tolist()
+                    'avg_prob_increase': avg_prob_increase,
+                    'median_prob_increase': median_prob_increase,
+                    'positive_increases': positive_increases,
+                    'success_rate': positive_increases / len(test_images),
+                    'avg_rank_improvement': avg_rank_improvement,
+                    'prob_increases': prob_increases,
+                    'rank_improvements': rank_improvements
                 }
 
                 pattern_results.append(result)
 
                 # Print result
-                status = "✓ CORRECT" if is_correct else "✗ WRONG"
-                top5_status = "(in Top-5)" if is_in_top5 and not is_correct else ""
-                print(f"\nPattern {pattern_id} (usage: {pattern_info['usage_percent']:.1f}%):")
-                print(f"  {status} {top5_status}")
-                print(f"  Predicted: {result['predicted_class_name']} (class {pred_class})")
-                print(f"  Target class probability: {pred_prob:.4f}")
-                if not is_correct:
-                    print(f"  Top prediction probability: {result['top5_probs'][0]:.4f}")
+                success_rate = positive_increases / len(test_images) * 100
+                status = "✓ EFFECTIVE" if success_rate > 50 else "~ WEAK" if success_rate > 25 else "✗ INEFFECTIVE"
+                print(f"  {status}")
+                print(f"  Avg probability increase: {avg_prob_increase:+.4f}")
+                print(f"  Median probability increase: {median_prob_increase:+.4f}")
+                print(f"  Success rate: {positive_increases}/{len(test_images)} ({success_rate:.1f}%)")
+                print(f"  Avg rank improvement: {avg_rank_improvement:+.1f}")
 
-        # Calculate statistics
-        accuracy = correct_count / len(valid_patterns) if valid_patterns else 0.0
+        # Calculate overall statistics
+        successful_patterns = sum(1 for r in pattern_results if r['success_rate'] > 0.5)
+        avg_success_rate = np.mean([r['success_rate'] for r in pattern_results])
 
         print(f"\n{'='*80}")
         print(f"RESULTS SUMMARY")
         print(f"{'='*80}")
         print(f"Class: {class_name} (Class {class_id})")
         print(f"Total patterns tested: {len(valid_patterns)}")
-        print(f"Correct predictions: {correct_count}")
-        print(f"Accuracy: {accuracy*100:.2f}%")
-
-        # Top-5 accuracy
-        top5_correct = sum(1 for r in pattern_results if r['is_in_top5'])
-        top5_accuracy = top5_correct / len(valid_patterns) if valid_patterns else 0.0
-        print(f"Top-5 Accuracy: {top5_accuracy*100:.2f}%")
+        print(f"Effective patterns (>50% success): {successful_patterns}")
+        print(f"Average success rate: {avg_success_rate*100:.2f}%")
+        print(f"\nConclusion: {'✓ Patterns are PREDICTIVE' if successful_patterns > 0 else '✗ Patterns are NOT predictive'}")
 
         return {
             'class_id': class_id,
             'class_name': class_name,
             'total_patterns': self.k_subpatterns,
             'tested_patterns': len(valid_patterns),
-            'correct_predictions': correct_count,
-            'top5_predictions': top5_correct,
-            'accuracy': accuracy,
-            'top5_accuracy': top5_accuracy,
+            'successful_injections': successful_patterns,
+            'avg_success_rate': avg_success_rate,
+            'injection_params': {
+                'alpha': alpha,
+                'method': injection_method,
+                'num_test_images': len(test_images)
+            },
             'pattern_results': pattern_results
         }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Verify pattern predictability for LDDMM model'
+        description='Verify pattern predictability using pattern injection'
     )
     parser.add_argument('--checkpoint', type=str, default='checkpoints/lddmm_model_final.pth',
                        help='Path to model checkpoint')
+    parser.add_argument('--data_dir', type=str,
+                       default='./data/saliency_imagenet1k_resnet50_100',
+                       help='Directory with saliency maps')
     parser.add_argument('--class_id', type=int, required=True,
                        help='Class ID to verify patterns for')
+    parser.add_argument('--num_test_images', type=int, default=20,
+                       help='Number of random test images from other classes')
     parser.add_argument('--min_usage', type=float, default=0.0,
                        help='Minimum usage percentage to include (default: 0.0 = exclude zero patterns)')
+    parser.add_argument('--alpha', type=float, default=0.3,
+                       help='Pattern injection strength (0-1, default: 0.3)')
+    parser.add_argument('--injection_method', type=str, default='additive',
+                       choices=['additive', 'multiplicative'],
+                       help='Pattern injection method (default: additive)')
+    parser.add_argument('--images_per_class', type=int, default=100,
+                       help='Number of images per class (must match saliency generation)')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use (cuda/cpu)')
     parser.add_argument('--output', type=str, default=None,
@@ -331,30 +478,48 @@ def main():
 
     args = parser.parse_args()
 
+    # Set random seed for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+
     # Create predictor
     print(f"\n{'='*80}")
-    print(f"Pattern Predictability Verification")
+    print(f"Pattern Predictability Verification (Pattern Injection)")
     print(f"{'='*80}")
 
     predictor = PatternPredictor(
         checkpoint_path=args.checkpoint,
-        device=args.device
+        data_dir=args.data_dir,
+        device=args.device,
+        images_per_class=args.images_per_class
     )
 
     # Verify patterns
     results = predictor.verify_class_patterns(
         class_id=args.class_id,
-        min_usage_threshold=args.min_usage
+        num_test_images=args.num_test_images,
+        min_usage_threshold=args.min_usage,
+        alpha=args.alpha,
+        injection_method=args.injection_method
     )
 
     # Save results if requested
-    if args.output:
+    if args.output and results:
         import json
         output_path = Path(args.output)
         output_path.parent.mkdir(exist_ok=True, parents=True)
 
+        # Convert numpy arrays to lists for JSON serialization
+        results_json = results.copy()
+        for pattern in results_json.get('pattern_results', []):
+            if 'prob_increases' in pattern:
+                pattern['prob_increases'] = [float(x) for x in pattern['prob_increases']]
+            if 'rank_improvements' in pattern:
+                pattern['rank_improvements'] = [float(x) for x in pattern['rank_improvements']]
+
         with open(output_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results_json, f, indent=2)
 
         print(f"\n✓ Results saved to {output_path}")
 
