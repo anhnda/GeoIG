@@ -170,6 +170,12 @@ class PatternVisualizer:
         # Get class names
         self.class_names = {idx: name for idx, (wnid, name) in enumerate(IMAGENET2012_CLASSES.items())}
 
+        # Build or load class index for fast sample lookup
+        self.cache_file = self.data_dir / "class_index_cache.pkl"
+        print(f"\nBuilding/loading class index for fast lookup...")
+        self.class_index = self._load_or_build_index()
+        print(f"✓ Class index ready!")
+
     def denormalize_image(self, image_tensor):
         """
         Denormalize ImageNet-normalized image for visualization.
@@ -190,9 +196,118 @@ class PatternVisualizer:
         image = image.transpose(1, 2, 0)
         return image
 
+    def _is_cache_valid(self):
+        """
+        Check if the cached index file exists and is up-to-date.
+
+        Returns:
+            bool: True if cache is valid, False otherwise
+        """
+        if not self.cache_file.exists():
+            return False
+
+        # Check if cache is newer than all batch files
+        cache_mtime = self.cache_file.stat().st_mtime
+        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
+
+        if not batch_files:
+            return False
+
+        # If any batch file is newer than cache, cache is invalid
+        for batch_file in batch_files:
+            if batch_file.stat().st_mtime > cache_mtime:
+                return False
+
+        return True
+
+    def _build_class_index(self):
+        """
+        Build an index mapping class_id -> list of (batch_file, item_index).
+
+        This allows fast lookup without loading all batch files.
+
+        Returns:
+            dict: {class_id: [(batch_file, item_idx), ...]}
+        """
+        from collections import defaultdict
+        import time
+
+        print("  Building class index from batch files...")
+        start_time = time.time()
+
+        class_index = defaultdict(list)
+        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
+
+        if not batch_files:
+            print(f"  Warning: No batch files found in {self.saliency_dir}")
+            return {}
+
+        for batch_idx, batch_file in enumerate(batch_files):
+            batch_data = joblib.load(batch_file)
+
+            for item_idx, item in enumerate(batch_data):
+                class_id = item['true_label']
+                class_index[class_id].append((str(batch_file), item_idx))
+
+            if (batch_idx + 1) % 10 == 0:
+                print(f"  Processed {batch_idx + 1}/{len(batch_files)} batch files...")
+
+        elapsed = time.time() - start_time
+        total_samples = sum(len(samples) for samples in class_index.values())
+        print(f"  ✓ Index built in {elapsed:.2f}s: {len(class_index)} classes, {total_samples} samples")
+
+        return dict(class_index)
+
+    def _save_index_cache(self, class_index):
+        """
+        Save the class index to cache file.
+
+        Args:
+            class_index: The index to save
+        """
+        print(f"  Saving index cache to {self.cache_file}...")
+        joblib.dump(class_index, self.cache_file, compress=3)
+        print(f"  ✓ Cache saved")
+
+    def _load_index_cache(self):
+        """
+        Load the class index from cache file.
+
+        Returns:
+            dict: The cached index
+        """
+        print(f"  Loading index from cache...")
+        import time
+        start_time = time.time()
+        class_index = joblib.load(self.cache_file)
+        elapsed = time.time() - start_time
+        total_samples = sum(len(samples) for samples in class_index.values())
+        print(f"  ✓ Cache loaded in {elapsed:.2f}s: {len(class_index)} classes, {total_samples} samples")
+        return class_index
+
+    def _load_or_build_index(self):
+        """
+        Load index from cache if valid, otherwise build and cache it.
+
+        Returns:
+            dict: {class_id: [(batch_file, item_idx), ...]}
+        """
+        if self._is_cache_valid():
+            print("  Cache is up-to-date, loading from cache...")
+            return self._load_index_cache()
+        else:
+            if self.cache_file.exists():
+                print("  Cache is outdated, rebuilding...")
+            else:
+                print("  No cache found, building for the first time...")
+
+            class_index = self._build_class_index()
+            self._save_index_cache(class_index)
+            return class_index
+
     def sample_class_images(self, class_id, num_samples=None):
         """
-        Sample images from a specific class on-demand without loading all data.
+        Sample images from a specific class using pre-built index for fast lookup.
 
         Args:
             class_id: Class index to sample from
@@ -201,33 +316,53 @@ class PatternVisualizer:
         Returns:
             List of sample dictionaries for the class
         """
-        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
+        # Check if class exists in index
+        if class_id not in self.class_index:
+            print(f"Warning: Class {class_id} not found in index")
+            return []
 
+        # Get locations for this class from index
+        class_locations = self.class_index[class_id]
+
+        # Limit to requested number of samples
+        if num_samples is not None:
+            class_locations = class_locations[:num_samples]
+
+        # Load only the required batch files (group by batch file)
+        from collections import defaultdict
+        batch_to_indices = defaultdict(list)
+
+        for batch_file, item_idx in class_locations:
+            batch_to_indices[batch_file].append(item_idx)
+
+        # Load samples from each batch file
         class_samples = []
+        loaded_items = {}  # Cache loaded batches
 
-        for batch_file in batch_files:
-            batch_data = joblib.load(batch_file)
+        for batch_file, item_indices in batch_to_indices.items():
+            # Load batch file once
+            if batch_file not in loaded_items:
+                batch_data = joblib.load(batch_file)
+                loaded_items[batch_file] = batch_data
 
-            for item in batch_data:
-                if item['true_label'] == class_id:
-                    # Only store necessary data
-                    sample_dict = {
-                        'sample_index': item.get('sample_index', item.get('index')),
-                        'confidence': item['confidence'],
-                        'saliency_map': item['saliency_map']
-                    }
+            # Extract requested items
+            for item_idx in item_indices:
+                item = loaded_items[batch_file][item_idx]
 
-                    # Add optional fields if available
-                    if 'original_image' in item:
-                        sample_dict['original_image'] = item['original_image']
-                    if 'image_path' in item:
-                        sample_dict['image_path'] = item['image_path']
+                # Only store necessary data
+                sample_dict = {
+                    'sample_index': item.get('sample_index', item.get('index')),
+                    'confidence': item['confidence'],
+                    'saliency_map': item['saliency_map']
+                }
 
-                    class_samples.append(sample_dict)
+                # Add optional fields if available
+                if 'original_image' in item:
+                    sample_dict['original_image'] = item['original_image']
+                if 'image_path' in item:
+                    sample_dict['image_path'] = item['image_path']
 
-                    # Early exit if we have enough samples
-                    if num_samples and len(class_samples) >= num_samples:
-                        return class_samples
+                class_samples.append(sample_dict)
 
         return class_samples
 
