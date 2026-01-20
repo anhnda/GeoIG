@@ -442,6 +442,17 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             v_coarse: (B, 2, 14, 14) - Coarse velocity field
             v_fine: (B, 2, 112, 112) - Fine velocity field
         """
+        # DEBUG: Check input shape
+        if h_i.shape[1] == 0:
+            print(f"\n{'='*80}")
+            print(f"❌ CRITICAL ERROR: Input tensor has 0 channels!")
+            print(f"   h_i.shape = {h_i.shape}")
+            if original_images is not None:
+                print(f"   original_images.shape = {original_images.shape}")
+            print(f"   This means the DataLoader is returning corrupted data")
+            print(f"{'='*80}\n")
+            raise RuntimeError(f"Input tensor has invalid shape: {h_i.shape}, expected [B, 1, 224, 224]")
+
         B = h_i.shape[0]
 
         # Optional: Apply edge gating
@@ -821,9 +832,20 @@ def safe_collate_fn(batch):
     else:
         raise ValueError(f"Unexpected batch item length: {len(batch[0])}")
 
+    # DEBUG: Check first saliency
+    if saliencies[0].shape != (1, 224, 224):
+        print(f"\n❌ COLLATE ERROR: First saliency has wrong shape!")
+        print(f"   Expected: (1, 224, 224)")
+        print(f"   Got: {saliencies[0].shape}")
+        print(f"   Batch size: {len(saliencies)}")
+
     # Validate each saliency map
     for i, sal in enumerate(saliencies):
         if sal.shape != (1, 224, 224):
+            print(f"\n❌ COLLATE ERROR in sample {i}:")
+            print(f"   Shape: {sal.shape}")
+            print(f"   Type: {type(sal)}")
+            print(f"   Dtype: {sal.dtype if hasattr(sal, 'dtype') else 'N/A'}")
             raise ValueError(f"Sample {i}: Invalid saliency shape {sal.shape}, expected (1, 224, 224)")
 
     # Validate each image if not None
