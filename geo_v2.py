@@ -548,7 +548,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
                 samples = samples[indices]
 
             # Compute Wasserstein barycenter (reduced iterations to save memory)
-            barycenter = sinkhorn_barycenter(samples, reg=0.05, num_iter=10)
+            barycenter = sinkhorn_barycenter(samples, reg=0.02, num_iter=10)
 
             # Free memory immediately
             del samples
