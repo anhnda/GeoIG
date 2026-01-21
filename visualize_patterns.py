@@ -758,8 +758,14 @@ def main():
                        help='Path to ImageNet directory (to load original images if not in saliency data)')
     parser.add_argument('--images_per_class', type=int, default=100,
                        help='Number of images per class (must match saliency generation)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for sample selection (default: 42)')
 
     args = parser.parse_args()
+
+    # Set random seed for reproducibility
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Create output directory
     output_dir = Path(args.output_dir)
