@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 from tqdm import tqdm
+import joblib
+from collections import defaultdict
 
 from geo_v2 import SaliencyMapDataset
 
@@ -41,39 +43,198 @@ def load_checkpoint(checkpoint_path, device='cuda'):
     return templates, counts
 
 
-def get_class_samples(dataset, class_id, num_samples=5):
-    """Get random samples from a specific class."""
-    # Find all samples for this class
-    class_indices = []
-    for idx in range(len(dataset)):
-        if dataset.labels[idx].item() == class_id:
-            class_indices.append(idx)
+def _is_cache_valid(cache_file, saliency_dir):
+    """
+    Check if the cached index file exists and is up-to-date.
 
-    if len(class_indices) == 0:
-        raise ValueError(f"No samples found for class {class_id}")
+    Returns:
+        bool: True if cache is valid, False otherwise
+    """
+    if not cache_file.exists():
+        return False
 
-    print(f"Found {len(class_indices)} samples for class {class_id}")
+    # Check if cache is newer than all batch files
+    cache_mtime = cache_file.stat().st_mtime
+    batch_files = sorted(saliency_dir.glob("batch_*.pkl"))
 
-    # Randomly sample
-    num_samples = min(num_samples, len(class_indices))
-    selected_indices = np.random.choice(class_indices, size=num_samples, replace=False)
+    if not batch_files:
+        return False
 
+    # If any batch file is newer than cache, cache is invalid
+    for batch_file in batch_files:
+        if batch_file.stat().st_mtime > cache_mtime:
+            return False
+
+    return True
+
+
+def _build_class_index(saliency_dir):
+    """
+    Build an index mapping class_id -> list of (batch_file, item_index).
+
+    This allows fast lookup without loading all batch files.
+
+    Returns:
+        dict: {class_id: [(batch_file, item_idx), ...]}
+    """
+    import time
+
+    print("  Building class index from batch files...")
+    start_time = time.time()
+
+    class_index = defaultdict(list)
+    batch_files = sorted(saliency_dir.glob("batch_*.pkl"))
+
+    if not batch_files:
+        print(f"  Warning: No batch files found in {saliency_dir}")
+        return {}
+
+    for batch_idx, batch_file in enumerate(batch_files):
+        batch_data = joblib.load(batch_file)
+
+        for item_idx, item in enumerate(batch_data):
+            class_id = item['true_label']
+            class_index[class_id].append((str(batch_file), item_idx))
+
+        if (batch_idx + 1) % 10 == 0:
+            print(f"  Processed {batch_idx + 1}/{len(batch_files)} batch files...")
+
+    elapsed = time.time() - start_time
+    total_samples = sum(len(samples) for samples in class_index.values())
+    print(f"  ✓ Index built in {elapsed:.2f}s: {len(class_index)} classes, {total_samples} samples")
+
+    return dict(class_index)
+
+
+def _save_index_cache(cache_file, class_index):
+    """
+    Save the class index to cache file.
+
+    Args:
+        cache_file: Path to cache file
+        class_index: The index to save
+    """
+    print(f"  Saving index cache to {cache_file}...")
+    joblib.dump(class_index, cache_file, compress=3)
+    print(f"  ✓ Cache saved")
+
+
+def _load_index_cache(cache_file):
+    """
+    Load the class index from cache file.
+
+    Returns:
+        dict: The cached index
+    """
+    import time
+
+    print(f"  Loading index from cache...")
+    start_time = time.time()
+    class_index = joblib.load(cache_file)
+    elapsed = time.time() - start_time
+    total_samples = sum(len(samples) for samples in class_index.values())
+    print(f"  ✓ Cache loaded in {elapsed:.2f}s: {len(class_index)} classes, {total_samples} samples")
+    return class_index
+
+
+def _load_or_build_index(cache_file, saliency_dir):
+    """
+    Load index from cache if valid, otherwise build and cache it.
+
+    Returns:
+        dict: {class_id: [(batch_file, item_idx), ...]}
+    """
+    if _is_cache_valid(cache_file, saliency_dir):
+        print("  Cache is up-to-date, loading from cache...")
+        return _load_index_cache(cache_file)
+    else:
+        if cache_file.exists():
+            print("  Cache is outdated, rebuilding...")
+        else:
+            print("  No cache found, building for the first time...")
+
+        class_index = _build_class_index(saliency_dir)
+        _save_index_cache(cache_file, class_index)
+        return class_index
+
+
+def get_class_samples(class_index, class_id, data_dir, num_samples=5):
+    """
+    Get random samples from a specific class using pre-built index for fast lookup.
+
+    Args:
+        class_index: Pre-built class index {class_id: [(batch_file, item_idx), ...]}
+        class_id: Class index to sample from
+        data_dir: Path to data directory
+        num_samples: Number of samples to retrieve
+
+    Returns:
+        List of sample dictionaries
+    """
+    # Check if class exists in index
+    if class_id not in class_index:
+        print(f"Warning: Class {class_id} not found in index")
+        return []
+
+    # Get locations for this class from index
+    class_locations = class_index[class_id]
+    print(f"Found {len(class_locations)} samples for class {class_id}")
+
+    # Randomly sample locations
+    num_samples = min(num_samples, len(class_locations))
+    selected_indices = np.random.choice(len(class_locations), size=num_samples, replace=False)
+    selected_locations = [class_locations[i] for i in selected_indices]
+
+    # Load only the required batch files (group by batch file)
+    batch_to_indices = defaultdict(list)
+    for batch_file, item_idx in selected_locations:
+        batch_to_indices[batch_file].append(item_idx)
+
+    # Load samples from each batch file
     samples = []
-    for idx in selected_indices:
-        saliency, label, image = dataset[idx]
-        samples.append({
-            'saliency': saliency,  # (1, 224, 224)
-            'label': label,
-            'image': image,  # (3, 224, 224) or None
-            'index': idx
-        })
+    loaded_batches = {}  # Cache loaded batches
+
+    for batch_file, item_indices in batch_to_indices.items():
+        # Load batch file once
+        if batch_file not in loaded_batches:
+            batch_data = joblib.load(batch_file)
+            loaded_batches[batch_file] = batch_data
+
+        # Extract requested items
+        for item_idx in item_indices:
+            item = loaded_batches[batch_file][item_idx]
+
+            # Convert to tensor format expected by visualization functions
+            saliency = torch.from_numpy(item['saliency_map']).float().unsqueeze(0)  # (1, 224, 224)
+
+            # Try to get original image if available
+            image = None
+            if 'original_image' in item:
+                # Already in normalized tensor format
+                image = torch.from_numpy(item['original_image']).float()  # (3, 224, 224)
+
+            samples.append({
+                'saliency': saliency,
+                'label': class_id,
+                'image': image,
+                'index': item.get('sample_index', item_idx)
+            })
 
     return samples
 
 
-def visualize_class_templates(templates, counts, dataset, class_id, num_samples=5, save_path=None):
+def visualize_class_templates(templates, counts, class_index, data_dir, class_id, num_samples=5, save_path=None):
     """
     Visualize mean template for a class along with sample images.
+
+    Args:
+        templates: (num_classes, 1, 224, 224) mean templates
+        counts: (num_classes,) sample counts
+        class_index: Pre-built class index
+        data_dir: Path to data directory
+        class_id: Class to visualize
+        num_samples: Number of samples to show
+        save_path: Optional path to save figure
 
     Layout:
     - Row 1: Sample images
@@ -81,7 +242,7 @@ def visualize_class_templates(templates, counts, dataset, class_id, num_samples=
     - Row 3: Mean template
     """
     # Get random samples from this class
-    samples = get_class_samples(dataset, class_id, num_samples=num_samples)
+    samples = get_class_samples(class_index, class_id, data_dir, num_samples=num_samples)
     num_samples = len(samples)
 
     # Get mean template for this class
@@ -154,14 +315,22 @@ def visualize_class_templates(templates, counts, dataset, class_id, num_samples=
     plt.show()
 
 
-def visualize_single_sample(templates, counts, dataset, class_id, save_path=None):
+def visualize_single_sample(templates, counts, class_index, data_dir, class_id, save_path=None):
     """
     Visualize a single sample with mean template side-by-side.
+
+    Args:
+        templates: (num_classes, 1, 224, 224) mean templates
+        counts: (num_classes,) sample counts
+        class_index: Pre-built class index
+        data_dir: Path to data directory
+        class_id: Class to visualize
+        save_path: Optional path to save figure
 
     Layout: [Image] [IG] [Mean Template]
     """
     # Get one sample
-    samples = get_class_samples(dataset, class_id, num_samples=1)
+    samples = get_class_samples(class_index, class_id, data_dir, num_samples=1)
     sample = samples[0]
 
     # Get mean template
@@ -259,14 +428,17 @@ Examples:
 
     templates, counts = load_checkpoint(checkpoint_path, device=device)
 
-    # Load dataset
-    print(f"\nLoading dataset from {args.data_dir}...")
-    dataset = SaliencyMapDataset(
-        data_dir=args.data_dir,
-        max_samples_per_class=None,
-        load_images=True,  # Need images for visualization
-        max_samples=100000
-    )
+    # Build or load class index for fast sample lookup
+    data_dir = Path(args.data_dir)
+    saliency_dir = data_dir / "saliency_maps"
+
+    if not saliency_dir.exists():
+        raise FileNotFoundError(f"Saliency directory not found: {saliency_dir}")
+
+    cache_file = data_dir / "class_index_cache.pkl"
+    print(f"\nBuilding/loading class index for fast lookup...")
+    class_index = _load_or_build_index(cache_file, saliency_dir)
+    print(f"✓ Class index ready!")
 
     # Auto-generate save path if not provided
     if args.save_path is None:
@@ -280,7 +452,8 @@ Examples:
         visualize_single_sample(
             templates=templates,
             counts=counts,
-            dataset=dataset,
+            class_index=class_index,
+            data_dir=data_dir,
             class_id=args.class_id,
             save_path=args.save_path
         )
@@ -288,7 +461,8 @@ Examples:
         visualize_class_templates(
             templates=templates,
             counts=counts,
-            dataset=dataset,
+            class_index=class_index,
+            data_dir=data_dir,
             class_id=args.class_id,
             num_samples=args.num_samples,
             save_path=args.save_path
