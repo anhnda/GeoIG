@@ -324,8 +324,12 @@ class PatternVisualizer:
         # Get locations for this class from index
         class_locations = self.class_index[class_id]
 
-        # Limit to requested number of samples
-        if num_samples is not None:
+        # Randomly sample if num_samples is specified
+        if num_samples is not None and num_samples < len(class_locations):
+            selected_indices = np.random.choice(len(class_locations), size=num_samples, replace=False)
+            class_locations = [class_locations[i] for i in selected_indices]
+        elif num_samples is not None:
+            # If requested more samples than available, just use all
             class_locations = class_locations[:num_samples]
 
         # Load only the required batch files (group by batch file)
