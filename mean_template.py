@@ -104,9 +104,9 @@ Example:
                        help='Directory with saliency maps')
     parser.add_argument('--num_classes', type=int, default=1000,
                        help='Number of classes (default: 1000)')
-    parser.add_argument('--output', type=str, default='mean_templates.pth',
+    parser.add_argument('--output', type=str, default='checkpoints_mean/mean_templates.pth',
                        help='Output file for mean templates (default: mean_templates.pth)')
-    parser.add_argument('--sparsity_percentile', type=float, default=98,
+    parser.add_argument('--sparsity_percentile', type=float, default=70,
                        help='Sparsity percentile threshold (default: 98)')
     parser.add_argument('--top_k_percent', type=float, default=3,
                        help='Keep only top K%% of pixels (default: 3)')
