@@ -23,7 +23,7 @@ from collections import defaultdict
 from PIL import Image
 from torchvision import transforms
 
-from saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
+from backup.saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
 
 
 def load_checkpoint(checkpoint_path, device='cuda'):

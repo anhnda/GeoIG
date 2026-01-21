@@ -35,9 +35,9 @@ import random
 import sys
 sys.path.append('.')
 from geo_patterns import LDDMM_GlobalPatternPipeline
-from geo_x import AdvancedLDDMM_Pipeline
+from misc.geo_x import AdvancedLDDMM_Pipeline
 from full_classes import IMAGENET2012_CLASSES
-from saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
+from misc.saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
 
 
 class PatternPredictor:
