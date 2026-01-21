@@ -106,9 +106,9 @@ Example:
                        help='Number of classes (default: 1000)')
     parser.add_argument('--output', type=str, default='checkpoints_mean/mean_templates.pth',
                        help='Output file for mean templates (default: mean_templates.pth)')
-    parser.add_argument('--sparsity_percentile', type=float, default=20,
+    parser.add_argument('--sparsity_percentile', type=float, default=10,
                        help='Sparsity percentile threshold (default: 98)')
-    parser.add_argument('--top_k_percent', type=float, default=85,
+    parser.add_argument('--top_k_percent', type=float, default=90,
                        help='Keep only top K%% of pixels (default: 3)')
     parser.add_argument('--max_samples_per_class', type=int, default=None,
                        help='Max samples per class (default: None = all)')
