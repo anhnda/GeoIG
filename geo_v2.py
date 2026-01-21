@@ -124,6 +124,7 @@ class MultiScalePredictor(nn.Module):
             nn.Tanh()
         )
 
+
         # Scaling factors
         self.coarse_scale = 3.0  # Larger deformations for coarse alignment
         self.fine_scale = 0.5    # Smaller residual corrections
