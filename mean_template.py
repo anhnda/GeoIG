@@ -14,7 +14,7 @@ from pathlib import Path
 from tqdm import tqdm
 import argparse
 
-from geo_v2 import SaliencyMapDataset
+from misc.geo_v2 import SaliencyMapDataset
 
 
 def compute_mean_templates(dataset, num_classes=1000, sparsity_percentile=98, top_k_percent=3):

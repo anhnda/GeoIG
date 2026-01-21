@@ -84,7 +84,7 @@ def test_dataset_loading(data_dir, load_images=True):
     # Import the dataset class
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    from geo_v2 import SaliencyMapDataset
+    from misc.geo_v2 import SaliencyMapDataset
 
     try:
         dataset = SaliencyMapDataset(data_dir, load_images=load_images, cache_size=2)
@@ -157,7 +157,7 @@ def test_dataloader_collation(data_dir, load_images=True):
 
     import sys
     sys.path.insert(0, str(Path(__file__).parent))
-    from geo_v2 import SaliencyMapDataset, safe_collate_fn
+    from misc.geo_v2 import SaliencyMapDataset, safe_collate_fn
     from torch.utils.data import DataLoader
 
     try:
