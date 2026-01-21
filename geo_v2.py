@@ -519,7 +519,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     @torch.no_grad()
     def _update_template_bank_ot(self, h_aligned, class_ids, cluster_assigned,
-                                  sparsity_percentile=10, top_k_percent=90):
+                                  sparsity_percentile=20, top_k_percent=80):
         """
         Update template bank using Optimal Transport (Sinkhorn barycenter) with AGGRESSIVE top-K sharpening.
 
@@ -607,7 +607,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             del barycenter, barycenter_flat, top_k_values, top_k_indices, barycenter_sharp
 
     @torch.no_grad()
-    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=10):
+    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=20):
         """Fallback: Running average update with v2 aggressive sparsity (98th percentile)."""
         B = h_aligned.shape[0]
 
