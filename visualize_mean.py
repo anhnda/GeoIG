@@ -18,11 +18,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
-from tqdm import tqdm
 import joblib
 from collections import defaultdict
+from PIL import Image
+from torchvision import transforms
 
-from geo_v2 import SaliencyMapDataset
+from saliency_map_export import ImageNet1kSaliencyDataset, IMAGENET_RAW_DIR, IMAGENET_SAMPLED_DIR
 
 
 def load_checkpoint(checkpoint_path, device='cuda'):
@@ -158,14 +159,75 @@ def _load_or_build_index(cache_file, saliency_dir):
         return class_index
 
 
-def get_class_samples(class_index, class_id, data_dir, num_samples=5):
+def denormalize_image(image_tensor):
+    """
+    Denormalize ImageNet-normalized image for visualization.
+
+    Args:
+        image_tensor: (3, H, W) normalized image
+
+    Returns:
+        (H, W, 3) RGB image in [0, 1] range
+    """
+    # ImageNet normalization parameters
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+
+    image = image_tensor.copy()
+    # Denormalize: x_orig = x_norm * std + mean
+    for i in range(3):
+        image[i] = image[i] * std[i] + mean[i]
+    # Clip to valid range
+    image = np.clip(image, 0, 1)
+    # Convert to HWC format
+    image = image.transpose(1, 2, 0)
+    return image
+
+
+def get_original_image(sample, imagenet_dataset, image_transform):
+    """
+    Get original image from sample - either from stored data or load from ImageNet dataset.
+
+    Args:
+        sample: Sample dictionary
+        imagenet_dataset: ImageNet dataset instance (or None)
+        image_transform: Transform to apply to images
+
+    Returns:
+        (H, W, 3) RGB image in [0, 1] range, or None if not available
+    """
+    # Method 1: Image already stored in normalized format (backward compatibility)
+    if 'image' in sample and sample['image'] is not None:
+        # Already a tensor in (3, 224, 224) format
+        img_np = sample['image'].cpu().numpy()
+        return denormalize_image(img_np)
+
+    if 'original_image' in sample:
+        return denormalize_image(sample['original_image'])
+
+    # Method 2: Load from ImageNet dataset using sample_index
+    if 'sample_index' in sample and imagenet_dataset is not None:
+        try:
+            sample_idx = sample['sample_index']
+            image_pil, _ = imagenet_dataset[sample_idx]
+            # Transform to tensor and convert to numpy array
+            img_tensor = image_transform(image_pil).numpy()
+            # Convert from CHW to HWC and ensure [0, 1] range
+            img_array = img_tensor.transpose(1, 2, 0)
+            return img_array
+        except Exception as e:
+            print(f"Warning: Could not load image from dataset index {sample.get('sample_index')}: {e}")
+
+    return None
+
+
+def get_class_samples(class_index, class_id, num_samples=5):
     """
     Get random samples from a specific class using pre-built index for fast lookup.
 
     Args:
         class_index: Pre-built class index {class_id: [(batch_file, item_idx), ...]}
         class_id: Class index to sample from
-        data_dir: Path to data directory
         num_samples: Number of samples to retrieve
 
     Returns:
@@ -207,23 +269,21 @@ def get_class_samples(class_index, class_id, data_dir, num_samples=5):
             # Convert to tensor format expected by visualization functions
             saliency = torch.from_numpy(item['saliency_map']).float().unsqueeze(0)  # (1, 224, 224)
 
-            # Try to get original image if available
-            image = None
-            if 'original_image' in item:
-                # Already in normalized tensor format
-                image = torch.from_numpy(item['original_image']).float()  # (3, 224, 224)
-
+            # Store sample with necessary metadata
             samples.append({
                 'saliency': saliency,
                 'label': class_id,
-                'image': image,
+                'image': None,  # Will be loaded on-demand
+                'sample_index': item.get('sample_index', item.get('index')),
+                'original_image': item.get('original_image'),  # If stored in batch
                 'index': item.get('sample_index', item_idx)
             })
 
     return samples
 
 
-def visualize_class_templates(templates, counts, class_index, data_dir, class_id, num_samples=5, save_path=None):
+def visualize_class_templates(templates, counts, class_index, class_id, num_samples=5,
+                            imagenet_dataset=None, image_transform=None, save_path=None):
     """
     Visualize mean template for a class along with sample images.
 
@@ -231,9 +291,10 @@ def visualize_class_templates(templates, counts, class_index, data_dir, class_id
         templates: (num_classes, 1, 224, 224) mean templates
         counts: (num_classes,) sample counts
         class_index: Pre-built class index
-        data_dir: Path to data directory
         class_id: Class to visualize
         num_samples: Number of samples to show
+        imagenet_dataset: Optional ImageNet dataset for loading images
+        image_transform: Transform for images
         save_path: Optional path to save figure
 
     Layout:
@@ -242,7 +303,7 @@ def visualize_class_templates(templates, counts, class_index, data_dir, class_id
     - Row 3: Mean template
     """
     # Get random samples from this class
-    samples = get_class_samples(class_index, class_id, data_dir, num_samples=num_samples)
+    samples = get_class_samples(class_index, class_id, num_samples=num_samples)
     num_samples = len(samples)
 
     # Get mean template for this class
@@ -263,14 +324,12 @@ def visualize_class_templates(templates, counts, class_index, data_dir, class_id
     # Row 1: Original images
     for col_idx, sample in enumerate(samples):
         ax = axes[0, col_idx]
-        image = sample['image']  # (3, 224, 224)
 
-        if image is not None:
-            # Convert from (C, H, W) to (H, W, C) for visualization
-            img_np = image.cpu().numpy().transpose(1, 2, 0)
-            # Clip to [0, 1] range
-            img_np = np.clip(img_np, 0, 1)
-            ax.imshow(img_np)
+        # Load original image on-demand
+        original_image = get_original_image(sample, imagenet_dataset, image_transform)
+
+        if original_image is not None:
+            ax.imshow(original_image)
         else:
             ax.text(0.5, 0.5, 'No Image', ha='center', va='center')
             ax.set_xlim(0, 1)
@@ -315,7 +374,8 @@ def visualize_class_templates(templates, counts, class_index, data_dir, class_id
     plt.show()
 
 
-def visualize_single_sample(templates, counts, class_index, data_dir, class_id, save_path=None):
+def visualize_single_sample(templates, counts, class_index, class_id,
+                          imagenet_dataset=None, image_transform=None, save_path=None):
     """
     Visualize a single sample with mean template side-by-side.
 
@@ -323,14 +383,15 @@ def visualize_single_sample(templates, counts, class_index, data_dir, class_id, 
         templates: (num_classes, 1, 224, 224) mean templates
         counts: (num_classes,) sample counts
         class_index: Pre-built class index
-        data_dir: Path to data directory
         class_id: Class to visualize
+        imagenet_dataset: Optional ImageNet dataset for loading images
+        image_transform: Transform for images
         save_path: Optional path to save figure
 
     Layout: [Image] [IG] [Mean Template]
     """
     # Get one sample
-    samples = get_class_samples(class_index, class_id, data_dir, num_samples=1)
+    samples = get_class_samples(class_index, class_id, num_samples=1)
     sample = samples[0]
 
     # Get mean template
@@ -346,13 +407,16 @@ def visualize_single_sample(templates, counts, class_index, data_dir, class_id, 
 
     # Column 0: Original image
     ax = axes[0]
-    image = sample['image']
-    if image is not None:
-        img_np = image.cpu().numpy().transpose(1, 2, 0)
-        img_np = np.clip(img_np, 0, 1)
-        ax.imshow(img_np)
+
+    # Load original image on-demand
+    original_image = get_original_image(sample, imagenet_dataset, image_transform)
+
+    if original_image is not None:
+        ax.imshow(original_image)
     else:
         ax.text(0.5, 0.5, 'No Image', ha='center', va='center')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
     ax.set_title('Original Image', fontsize=12)
     ax.axis('off')
 
@@ -411,6 +475,8 @@ Examples:
                        help='Path to save visualization (default: auto-generated)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for sample selection (default: 42)')
+    parser.add_argument('--images_per_class', type=int, default=100,
+                       help='Number of images per class (must match saliency generation, default: 100)')
     args = parser.parse_args()
 
     # Set random seed
@@ -427,6 +493,28 @@ Examples:
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     templates, counts = load_checkpoint(checkpoint_path, device=device)
+
+    # Load ImageNet dataset for accessing original images
+    print(f"\nLoading ImageNet dataset for original images...")
+    image_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+    ])
+
+    try:
+        imagenet_dataset = ImageNet1kSaliencyDataset(
+            raw_dir=IMAGENET_RAW_DIR,
+            sampled_dir=IMAGENET_SAMPLED_DIR,
+            output_dir=Path(args.data_dir),
+            images_per_class=args.images_per_class,
+            force_resample=False
+        )
+        print(f"✓ ImageNet dataset loaded with {len(imagenet_dataset)} images")
+    except Exception as e:
+        print(f"Warning: Could not load ImageNet dataset: {e}")
+        print(f"Original images will not be available for visualization")
+        imagenet_dataset = None
 
     # Build or load class index for fast sample lookup
     data_dir = Path(args.data_dir)
@@ -453,8 +541,9 @@ Examples:
             templates=templates,
             counts=counts,
             class_index=class_index,
-            data_dir=data_dir,
             class_id=args.class_id,
+            imagenet_dataset=imagenet_dataset,
+            image_transform=image_transform,
             save_path=args.save_path
         )
     else:  # grid
@@ -462,9 +551,10 @@ Examples:
             templates=templates,
             counts=counts,
             class_index=class_index,
-            data_dir=data_dir,
             class_id=args.class_id,
             num_samples=args.num_samples,
+            imagenet_dataset=imagenet_dataset,
+            image_transform=image_transform,
             save_path=args.save_path
         )
 
