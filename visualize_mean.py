@@ -202,7 +202,7 @@ def get_original_image(sample, imagenet_dataset, image_transform):
         img_np = sample['image'].cpu().numpy()
         return denormalize_image(img_np)
 
-    if 'original_image' in sample:
+    if 'original_image' in sample and sample['original_image'] is not None:
         return denormalize_image(sample['original_image'])
 
     # Method 2: Load from ImageNet dataset using sample_index
