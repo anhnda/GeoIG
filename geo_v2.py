@@ -1,16 +1,6 @@
 """
 Advanced Geodesic Pattern Learning v2 - Refined for Sharp Structural Patterns
 
-IMPROVEMENTS OVER geo_x.py:
-1. AGGRESSIVE SPARSITY ENFORCEMENT (5x stronger):
-   - lambda_template_sparsity: 1.5 → 5.0
-   - sparsity_percentile: 90% → 98%
-   - top_k_percent: 5% → 3% (even sharper templates)
-
-2. VELOCITY FIELD ANTI-DIFFUSION:
-   - Fine-stage smoothness reduced 5x (0.1 → 0.02) to preserve sharp edges
-   - Coarse-stage smoothness slightly reduced (0.05 → 0.03)
-   - High Jacobian penalty (50.0) maintained to prevent tearing
 
 3. EDGE-AWARE GATING ENABLED BY DEFAULT:
    - Forces alignment based on physical object boundaries
@@ -402,7 +392,6 @@ class AdvancedLDDMM_Pipeline(nn.Module):
     Advanced LDDMM pipeline v2 with sharp structure recovery.
 
     V2 CHANGES:
-    - More aggressive sparsity enforcement in template updates (98% percentile, top 3%)
     - Loss function tuned for anti-diffusion (reduced smoothness penalties)
     - Edge-aware gating recommended by default to zero out background noise
 
@@ -442,8 +431,8 @@ class AdvancedLDDMM_Pipeline(nn.Module):
         print(f"\nAdvanced LDDMM Pipeline v2 Initialized:")
         print(f"  Multi-scale: Coarse (14×14) → Fine (112×112)")
         print(f"  Template update: {'Optimal Transport (Sinkhorn)' if use_ot else 'Running Average'}")
-        print(f"    - Sparsity: 98th percentile (v2: was 90th)")
-        print(f"    - Top-K sharpening: 3% (v2: was 5%)")
+        print(f"    - Sparsity:")
+        print(f"    - Top-K sharpening:")
         print(f"  Edge gating: {'Enabled' if use_edge_gating else 'Disabled'} (v2 default: ON)")
         print(f"  Classes: {num_classes}, Sub-patterns: {k_subpatterns}")
 
@@ -534,8 +523,8 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             h_aligned: (B, 1, H, W) - Aligned saliency maps
             class_ids: (B,) - Class indices
             cluster_assigned: (B,) - Cluster indices
-            sparsity_percentile: float - Percentile threshold for sparsity (default: 98, v2 increased)
-            top_k_percent: float - Keep only top K% of pixels (default: 3%, v2 decreased)
+            sparsity_percentile: float - Percentile threshold for sparsity
+            top_k_percent: float - Keep only top K% of pixels
         """
         B = h_aligned.shape[0]
 
@@ -1398,7 +1387,7 @@ RECOMMENDED USAGE:
         torch.cuda.empty_cache()
 
     print(f"\nV2 Improvements:")
-    print(f"  - AGGRESSIVE sparsity: template_sparsity=5.0 (was 1.5), percentile=98% (was 90%)")
+    print(f"  - AGGRESSIVE sparsity)")
     print(f"  - Anti-diffusion: fine_smooth=0.02 (was 0.1), coarse_smooth=0.03 (was 0.05)")
     print(f"  - Edge-aware gating: {'ENABLED' if args.use_edge_gating else 'DISABLED'} (default: ON)")
     print(f"\nFeatures:")
