@@ -1127,7 +1127,7 @@ class AdvancedLDDMMTrainer:
         # a single noisy pixel into a large blob to satisfy alignment loss.
         # This is essential for preserving sparse structures like "Ostrich" patterns.
         self.criterion = AdvancedLDDMMLoss(
-            lambda_smooth=0.01,                   # V2: Reduced 5x (0.1 → 0.02) for edge preservation
+            lambda_smooth=0.05,                   # V2: Reduced 5x (0.1 → 0.02) for edge preservation
             lambda_entropy=1.0,                   # Confident cluster assignments
             lambda_magnitude=0.00005,             # Allow detailed deformations
             lambda_diversity=2.0,                 # Use all K patterns
@@ -1138,7 +1138,7 @@ class AdvancedLDDMMTrainer:
             lambda_mass_conservation=5.0,       # CRITICAL: Perfect mass conservation
             lambda_sparsity_match=10.0,           # CRITICAL: Preserve sparsity patterns
             lambda_tv=0.5,                        # Reduce fragmentation
-            lambda_jacobian=75.0,                 # CRITICAL: Prevent spatial stretching/compression!
+            lambda_jacobian=50.0,                 # CRITICAL: Prevent spatial stretching/compression!
             lambda_coarse_smooth=0.03             # V2: Reduced (0.05 → 0.03) for coarse field
         ).to(device)
 
