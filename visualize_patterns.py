@@ -452,17 +452,18 @@ class PatternVisualizer:
         for k in range(self.k_subpatterns):
             ax = axes[k]
 
-            # Plot template
+            # Plot template with normalization
             template = templates[k, 0]  # (H, W)
-            im = ax.imshow(template, cmap='hot', interpolation='bilinear')
+            vmax = template.max() if template.max() > 0 else 1.0
+            im = ax.imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
 
             # Add colorbar
             plt.colorbar(im, ax=ax, fraction=0.046)
 
-            # Title with usage count
+            # Title with usage count and max value
             usage_pct = counts[k] / counts.sum() * 100 if counts.sum() > 0 else 0
-            ax.set_title(f'Pattern {k}\nUsage: {int(counts[k])} ({usage_pct:.1f}%)',
-                        fontsize=10)
+            ax.set_title(f'Pattern {k} (max={vmax:.3f})\nUsage: {int(counts[k])} ({usage_pct:.1f}%)',
+                        fontsize=9)
             ax.axis('off')
 
         plt.tight_layout()
@@ -626,9 +627,11 @@ class PatternVisualizer:
             # Pattern template
             ax = fig.add_subplot(gs[1, 3+i]) if i < 2 else fig.add_subplot(gs[2, 0])
             template = templates[k, 0]
-            im = ax.imshow(template, cmap='hot', interpolation='bilinear')
-            ax.set_title(f'Pattern {k}\n({cluster_probs_np[k]*100:.1f}%)',
-                        fontsize=10, fontweight='bold')
+            # Normalize template for visualization
+            vmax = template.max() if template.max() > 0 else 1.0
+            im = ax.imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
+            ax.set_title(f'Pattern {k}\n({cluster_probs_np[k]*100:.1f}%) max={vmax:.3f}',
+                        fontsize=9, fontweight='bold')
             ax.axis('off')
             plt.colorbar(im, ax=ax, fraction=0.046)
 
@@ -733,8 +736,10 @@ class PatternVisualizer:
 
             # Assigned pattern
             template = self.model.templates[class_id, cluster_assigned].squeeze().cpu().numpy()
-            axes[i, col].imshow(template, cmap='hot', interpolation='bilinear')
-            axes[i, col].set_title(f'Pattern {cluster_assigned} Template', fontsize=10)
+            # Normalize template for better visualization (vmin=0, vmax=template's max)
+            vmax = template.max() if template.max() > 0 else 1.0
+            axes[i, col].imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
+            axes[i, col].set_title(f'Pattern {cluster_assigned} Template\n(max={vmax:.3f})', fontsize=9)
             axes[i, col].axis('off')
             col += 1
 
