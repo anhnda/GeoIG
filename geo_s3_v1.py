@@ -1250,7 +1250,8 @@ USAGE:
         enhance_mode=args.enhance_mode,
         alpha=args.alpha
     )
-    model = torch.compile(model)
+    # CRITICAL: Do NOT use torch.compile() - it breaks in-place template buffer updates!
+    # model = torch.compile(model)
 
     trainer = AdvancedLDDMMTrainer(
         model=model,
