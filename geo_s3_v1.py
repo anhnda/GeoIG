@@ -424,8 +424,8 @@ class AdvancedLDDMM_Pipeline(nn.Module):
     """
 
     def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224),
-                 device='cuda', temperature=0.1, use_ot=True,
-                 enhance_mode='log_power', alpha=0.5):
+                 device='cuda', temperature=0.5, use_ot=True,
+                 enhance_mode='none', alpha=0.5):
         super().__init__()
         self.num_classes = num_classes
         self.K = k_subpatterns
@@ -504,7 +504,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     @torch.no_grad()
     def _update_template_bank_ot_signal_aware(self, h_aligned, class_ids, cluster_assigned,
-                                              sparsity_percentile=50):
+                                              sparsity_percentile=30):
         """
         Update template bank using OT with signal-aware weighting.
 
@@ -565,7 +565,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             del barycenter
 
     @torch.no_grad()
-    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=50):
+    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=30):
         """Running average update with gentle sparsity."""
         B = h_aligned.shape[0]
 
@@ -1007,15 +1007,15 @@ class AdvancedLDDMMTrainer:
 
         self.criterion = AdvancedLDDMMLoss(
             lambda_smooth=0.05,
-            lambda_entropy=1.0,
+            lambda_entropy=0.5,  # Reduced from 1.0 to allow less confident assignments
             lambda_magnitude=0.00005,
-            lambda_diversity=2.0,
-            lambda_template_diversity=2.0,
-            lambda_template_sparsity=2.0,  # Reduced from 7.0
-            lambda_spatial_diversity=1,
-            lambda_compactness=2.0,  # Reduced from 15.0
-            lambda_mass_conservation=100.0,  # CRITICAL: Increased from 5.0 to enforce mass preservation
-            lambda_sparsity_match=10.0,
+            lambda_diversity=10.0,  # INCREASED from 2.0 to prevent cluster collapse
+            lambda_template_diversity=5.0,  # INCREASED from 2.0
+            lambda_template_sparsity=1.0,  # Reduced from 2.0 to preserve structure
+            lambda_spatial_diversity=2.0,  # Increased from 1.0
+            lambda_compactness=2.0,  # Keep low to allow extended structures
+            lambda_mass_conservation=100.0,  # CRITICAL: Enforce mass preservation
+            lambda_sparsity_match=20.0,  # INCREASED from 10.0 to preserve sparsity
             lambda_tv=0.5,
             lambda_jacobian=75.0,
             lambda_coarse_smooth=0.03
@@ -1207,9 +1207,9 @@ USAGE:
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--use_ot', action='store_true')
-    parser.add_argument('--enhance_mode', type=str, default='log_power',
+    parser.add_argument('--enhance_mode', type=str, default='none',
                        choices=['log_power', 'percentile', 'local_contrast', 'combined', 'none'],
-                       help='Signal enhancement mode (default: log_power, use none to disable)')
+                       help='Signal enhancement mode (default: none to preserve sparsity)')
     parser.add_argument('--alpha', type=float, default=0.5,
                        help='Power for log-power transform (default: 0.5)')
     parser.add_argument('--max_samples_per_class', type=int, default=None)
@@ -1245,7 +1245,7 @@ USAGE:
         k_subpatterns=args.k_subpatterns,
         img_res=(224, 224),
         device=device,
-        temperature=0.1,
+        temperature=0.5,  # Higher temperature for softer assignments (prevents cluster collapse)
         use_ot=args.use_ot,
         enhance_mode=args.enhance_mode,
         alpha=args.alpha
