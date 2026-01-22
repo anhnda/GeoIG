@@ -1435,7 +1435,6 @@ RECOMMENDED USAGE:
         use_ot=args.use_ot,
         use_edge_gating=args.use_edge_gating
     )
-    model = torch.compile(model) # Add this line
     # Create trainer
     trainer = AdvancedLDDMMTrainer(
         model=model,
