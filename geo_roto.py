@@ -580,32 +580,35 @@ class RotoLDDMM_Pipeline(nn.Module):
 
 class RotoLDDMMLoss(nn.Module):
     """
-    Loss functions for Roto-LDDMM.
+    Loss functions for Roto-LDDMM with improved structural priors.
 
-    Key differences from global LDDMM:
-    1. Reconstruction loss compares composed pattern to input
-    2. Sparsity on atoms (encourage blank space)
-    3. Diversity among atoms (avoid duplicates)
-    4. Pose regularization (prevent extreme transformations)
-    5. Attention entropy (encourage sparse atom usage)
+    Key improvements:
+    1. Total Variation (TV) on atoms for smooth, connected shapes
+    2. Atom compactness to prevent fragmented atoms
+    3. Corrected attention entropy (encourage sparse usage)
+    4. Structural diversity enforcement
     """
 
     def __init__(self,
                  lambda_reconstruction=1.0,
-                 lambda_atom_sparsity=2.0,
-                 lambda_atom_diversity=1.0,
+                 lambda_atom_sparsity=3.0,  # Increased for cleaner atoms
+                 lambda_atom_diversity=2.0,
                  lambda_pose_reg=0.01,
-                 lambda_attention_entropy=0.5,
+                 lambda_attention_sparsity=1.0,  # Renamed and fixed sign
                  lambda_local_smooth=0.05,
-                 lambda_mass_conservation=1.0):
+                 lambda_mass_conservation=1.0,
+                 lambda_atom_tv=2.0,  # NEW: Total Variation on atoms
+                 lambda_atom_compactness=1.0):  # NEW: Atom connectivity
         super().__init__()
         self.lambda_reconstruction = lambda_reconstruction
         self.lambda_atom_sparsity = lambda_atom_sparsity
         self.lambda_atom_diversity = lambda_atom_diversity
         self.lambda_pose_reg = lambda_pose_reg
-        self.lambda_attention_entropy = lambda_attention_entropy
+        self.lambda_attention_sparsity = lambda_attention_sparsity
         self.lambda_local_smooth = lambda_local_smooth
         self.lambda_mass_conservation = lambda_mass_conservation
+        self.lambda_atom_tv = lambda_atom_tv
+        self.lambda_atom_compactness = lambda_atom_compactness
 
     def reconstruction_loss(self, h_original, h_composed):
         """MSE between input and composed pattern."""
@@ -654,16 +657,19 @@ class RotoLDDMMLoss(nn.Module):
 
         return translation_penalty + scale_penalty
 
-    def attention_entropy_loss(self, attention):
+    def attention_sparsity_loss(self, attention):
         """
         Encourage sparse attention (few active atoms per image).
+
+        Uses L1 penalty to encourage most atoms to have zero attention.
+        This is more direct than entropy for achieving sparsity.
 
         Args:
             attention: (B, K) - Attention weights
         """
-        # Negative entropy (maximize entropy = uniform, minimize = sparse)
-        entropy = -(attention * torch.log(attention + 1e-10)).sum(dim=1)
-        return -entropy.mean()  # Negative to encourage low entropy
+        # L1 penalty encourages most weights to be zero
+        # Combined with softmax, this pushes to have 1-2 dominant atoms
+        return torch.abs(attention).sum(dim=1).mean()
 
     def local_smoothness_loss(self, v_local):
         """
@@ -684,6 +690,64 @@ class RotoLDDMMLoss(nn.Module):
 
         return diff_h.mean() + diff_w.mean()
 
+    def atom_total_variation_loss(self, atoms):
+        """
+        Total Variation (TV) loss on atoms to encourage smooth, connected shapes.
+
+        TV penalizes rapid changes in pixel values, encouraging atoms to form
+        coherent blobs rather than scattered pixels.
+
+        Args:
+            atoms: (B, K, 1, H, W) - Atom templates
+        """
+        B, K, C, H, W = atoms.shape
+
+        # Flatten batch and atoms
+        atoms_flat = atoms.view(B * K, C, H, W)
+
+        # Compute TV (sum of absolute gradients)
+        diff_h = torch.abs(atoms_flat[:, :, 1:, :] - atoms_flat[:, :, :-1, :])
+        diff_w = torch.abs(atoms_flat[:, :, :, 1:] - atoms_flat[:, :, :, :-1])
+
+        tv = diff_h.sum() + diff_w.sum()
+
+        # Normalize by number of pixels
+        tv = tv / (B * K * C * H * W)
+
+        return tv
+
+    def atom_compactness_loss(self, atoms):
+        """
+        Encourage atoms to be compact (active pixels close together).
+
+        Penalizes the variance of active pixel positions, encouraging atoms
+        to form tight, connected regions rather than scattered activations.
+
+        Args:
+            atoms: (B, K, 1, H, W) - Atom templates
+        """
+        B, K, C, H, W = atoms.shape
+
+        # Create coordinate grids
+        y_coords = torch.arange(H, device=atoms.device, dtype=torch.float32).view(1, 1, 1, H, 1)
+        x_coords = torch.arange(W, device=atoms.device, dtype=torch.float32).view(1, 1, 1, 1, W)
+
+        # Normalize atoms as probability distributions
+        atoms_norm = atoms / (atoms.sum(dim=(2, 3, 4), keepdim=True) + 1e-8)
+
+        # Compute centers of mass
+        center_y = (atoms_norm * y_coords).sum(dim=(2, 3, 4))  # (B, K)
+        center_x = (atoms_norm * x_coords).sum(dim=(2, 3, 4))  # (B, K)
+
+        # Compute variance (spread) around center
+        var_y = (atoms_norm * (y_coords - center_y.view(B, K, 1, 1, 1))**2).sum(dim=(2, 3, 4))
+        var_x = (atoms_norm * (x_coords - center_x.view(B, K, 1, 1, 1))**2).sum(dim=(2, 3, 4))
+
+        # Penalize large variance (encourage compact atoms)
+        compactness = (var_y + var_x).mean()
+
+        return compactness
+
     def mass_conservation_loss(self, h_original, h_composed):
         """Preserve total intensity."""
         mass_original = h_original.sum(dim=(1, 2, 3))
@@ -693,7 +757,7 @@ class RotoLDDMMLoss(nn.Module):
 
     def forward(self, h_original, h_composed, atoms, poses, attention, v_local=None):
         """
-        Compute total loss.
+        Compute total loss with improved structural priors.
 
         Args:
             h_original: (B, 1, H, W) - Input saliency
@@ -710,18 +774,22 @@ class RotoLDDMMLoss(nn.Module):
         loss_atom_sparse = self.atom_sparsity_loss(atoms)
         loss_atom_div = self.atom_diversity_loss(atoms)
         loss_pose_reg = self.pose_regularization_loss(poses)
-        loss_attention_ent = self.attention_entropy_loss(attention)
+        loss_attention_sparse = self.attention_sparsity_loss(attention)
         loss_local_smooth = self.local_smoothness_loss(v_local)
         loss_mass_cons = self.mass_conservation_loss(h_original, h_composed)
+        loss_atom_tv = self.atom_total_variation_loss(atoms)
+        loss_atom_compact = self.atom_compactness_loss(atoms)
 
         total_loss = (
             self.lambda_reconstruction * loss_recon +
             self.lambda_atom_sparsity * loss_atom_sparse +
             self.lambda_atom_diversity * loss_atom_div +
             self.lambda_pose_reg * loss_pose_reg +
-            self.lambda_attention_entropy * loss_attention_ent +
+            self.lambda_attention_sparsity * loss_attention_sparse +
             self.lambda_local_smooth * loss_local_smooth +
-            self.lambda_mass_conservation * loss_mass_cons
+            self.lambda_mass_conservation * loss_mass_cons +
+            self.lambda_atom_tv * loss_atom_tv +
+            self.lambda_atom_compactness * loss_atom_compact
         )
 
         return {
@@ -730,9 +798,11 @@ class RotoLDDMMLoss(nn.Module):
             'atom_sparsity': loss_atom_sparse,
             'atom_diversity': loss_atom_div,
             'pose_regularization': loss_pose_reg,
-            'attention_entropy': loss_attention_ent,
+            'attention_sparsity': loss_attention_sparse,
             'local_smoothness': loss_local_smooth,
-            'mass_conservation': loss_mass_cons
+            'mass_conservation': loss_mass_cons,
+            'atom_tv': loss_atom_tv,
+            'atom_compactness': loss_atom_compact
         }
 
 
@@ -902,20 +972,22 @@ class SaliencyMapDataset(Dataset):
 # ==========================================
 
 class RotoLDDMMTrainer:
-    """Trainer for Roto-LDDMM pipeline."""
+    """Trainer for Roto-LDDMM pipeline with warm-up phase."""
 
     def __init__(self, model, train_loader, val_loader=None,
-                 lr=1e-3, device='cuda', checkpoint_dir='./checkpoints_roto'):
+                 lr=1e-3, device='cuda', checkpoint_dir='./checkpoints_roto',
+                 warmup_epochs=0):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
+        self.warmup_epochs = warmup_epochs  # Freeze atoms for first N epochs
 
         # Optimizer (separate learning rates for atoms and predictor)
         self.optimizer = optim.Adam([
-            {'params': self.model.atom_bank.parameters(), 'lr': lr * 0.5},  # Slower for atoms
+            {'params': self.model.atom_bank.parameters(), 'lr': lr * 0.3},  # Much slower for atoms
             {'params': self.model.predictor.parameters(), 'lr': lr},
         ], weight_decay=1e-5)
 
@@ -923,21 +995,46 @@ class RotoLDDMMTrainer:
             self.optimizer, mode='min', factor=0.5, patience=5
         )
 
+        # Improved loss with structural priors
         self.criterion = RotoLDDMMLoss(
             lambda_reconstruction=1.0,
-            lambda_atom_sparsity=2.0,
-            lambda_atom_diversity=1.0,
+            lambda_atom_sparsity=5.0,          # Increased for cleaner atoms
+            lambda_atom_diversity=2.0,
             lambda_pose_reg=0.01,
-            lambda_attention_entropy=0.5,
+            lambda_attention_sparsity=2.0,     # Encourage sparse attention
             lambda_local_smooth=0.05,
-            lambda_mass_conservation=1.0
+            lambda_mass_conservation=1.0,
+            lambda_atom_tv=3.0,                # Strong TV for smooth atoms
+            lambda_atom_compactness=2.0        # Encourage compact atoms
         ).to(device)
 
         self.history = defaultdict(list)
 
+        print(f"\nTrainer Configuration:")
+        print(f"  Warmup epochs: {warmup_epochs} (atoms frozen)")
+        print(f"  Atom learning rate: {lr * 0.3:.6f}")
+        print(f"  Predictor learning rate: {lr:.6f}")
+        print(f"  Loss weights:")
+        print(f"    - Reconstruction: 1.0")
+        print(f"    - Atom Sparsity: 5.0 (high for clean atoms)")
+        print(f"    - Atom TV: 3.0 (smooth, connected shapes)")
+        print(f"    - Atom Compactness: 2.0 (prevent fragmentation)")
+        print(f"    - Attention Sparsity: 2.0 (few atoms per image)")
+        print(f"    - Atom Diversity: 2.0 (different atoms)")
+
     def train_epoch(self, epoch):
-        """Train for one epoch."""
+        """Train for one epoch with optional warmup."""
         self.model.train()
+
+        # Warmup phase: freeze atoms
+        if epoch <= self.warmup_epochs:
+            print(f"  [Warmup Phase] Atoms frozen, training predictor only")
+            for param in self.model.atom_bank.parameters():
+                param.requires_grad = False
+        else:
+            # Unfreeze atoms after warmup
+            for param in self.model.atom_bank.parameters():
+                param.requires_grad = True
 
         epoch_losses = defaultdict(float)
         num_batches = 0
@@ -984,7 +1081,9 @@ class RotoLDDMMTrainer:
 
             pbar.set_postfix({
                 'loss': losses['total'].item(),
-                'recon': losses['reconstruction'].item()
+                'recon': losses['reconstruction'].item(),
+                'tv': losses['atom_tv'].item(),
+                'attn_sp': losses['attention_sparsity'].item()
             })
 
             if batch_idx % 50 == 0:
@@ -1015,9 +1114,12 @@ class RotoLDDMMTrainer:
             print(f"\nEpoch {epoch}/{num_epochs} Summary:")
             print(f"  Total Loss: {avg_losses['total']:.4f}")
             print(f"  Reconstruction: {avg_losses['reconstruction']:.4f}")
+            print(f"  Atom TV: {avg_losses['atom_tv']:.4f}")
+            print(f"  Atom Compactness: {avg_losses['atom_compactness']:.4f}")
             print(f"  Atom Sparsity: {avg_losses['atom_sparsity']:.4f}")
             print(f"  Atom Diversity: {avg_losses['atom_diversity']:.4f}")
-            print(f"  Attention Entropy: {avg_losses['attention_entropy']:.4f}")
+            print(f"  Attention Sparsity: {avg_losses['attention_sparsity']:.4f}")
+            print(f"  Mass Conservation: {avg_losses['mass_conservation']:.4f}")
 
             self.scheduler.step(avg_losses['total'])
 
@@ -1090,13 +1192,15 @@ USAGE:
                        help='Disable local diffeomorphic refinement')
     parser.add_argument('--shared_atoms', action='store_true',
                        help='Use shared atoms across all classes (saves memory)')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                       help='Number of epochs to freeze atoms and train predictor only (default: 5)')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_roto',
                        help='Checkpoint directory')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*80}")
-    print(f"Roto-LDDMM: Part-Based Diffeomorphic Learning")
+    print(f"Roto-LDDMM: Part-Based Diffeomorphic Learning (Improved)")
     print(f"{'='*80}")
     print(f"Device: {device}")
 
@@ -1111,6 +1215,11 @@ USAGE:
         print(f"  Mode: CLASS-SPECIFIC atoms (each class has own {args.k_atoms} atoms)")
         print(f"  Memory: ~{atom_memory_gb:.3f} GB")
         print(f"  (Use --shared_atoms to reduce to ~{shared_memory_gb:.3f} GB)")
+
+    print(f"\nTraining Strategy:")
+    print(f"  Warmup epochs: {args.warmup_epochs} (atoms frozen, train predictor)")
+    print(f"  Main training: Epochs {args.warmup_epochs + 1}-{args.epochs}")
+    print(f"  Improved losses: TV + Compactness + Attention Sparsity")
 
     # Load dataset
     print(f"\nLoading saliency maps from {args.data_dir}...")
@@ -1150,7 +1259,8 @@ USAGE:
         train_loader=train_loader,
         lr=args.lr,
         device=device,
-        checkpoint_dir=args.checkpoint_dir
+        checkpoint_dir=args.checkpoint_dir,
+        warmup_epochs=args.warmup_epochs
     )
 
     # Train
