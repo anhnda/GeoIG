@@ -337,11 +337,11 @@ class RotoVisualizer:
             )
 
         # Move to CPU
-        h_i_np = h_i.squeeze().cpu().numpy()
-        h_composed_np = h_composed.squeeze().cpu().numpy()
-        attention_np = attention.squeeze().cpu().numpy()  # (K,)
-        poses_np = poses.squeeze().cpu().numpy()  # (K, 4)
-        atoms_transformed_np = atoms_transformed.squeeze().cpu().numpy()  # (K, 1, H, W)
+        h_i_np = h_i[0, 0].cpu().numpy()  # (H, W)
+        h_composed_np = h_composed[0, 0].cpu().numpy()  # (H, W)
+        attention_np = attention[0].cpu().numpy()  # (K,)
+        poses_np = poses[0].cpu().numpy()  # (K, 4)
+        atoms_transformed_np = atoms_transformed[0].cpu().numpy()  # (K, 1, H, W)
 
         # Get top-5 atoms by attention
         top_k_indices = np.argsort(attention_np)[::-1][:5]
@@ -515,12 +515,12 @@ class RotoVisualizer:
             axes[i, 0].axis('off')
 
             # Composed map
-            axes[i, 1].imshow(h_composed.squeeze().cpu().numpy(), cmap='hot', interpolation='bilinear')
+            axes[i, 1].imshow(h_composed[0, 0].cpu().numpy(), cmap='hot', interpolation='bilinear')
             axes[i, 1].set_title(f'Composed Map', fontsize=11)
             axes[i, 1].axis('off')
 
             # Attention weights
-            attention_np = attention.squeeze().cpu().numpy()
+            attention_np = attention[0].cpu().numpy()  # (K,)
             top_3 = np.argsort(attention_np)[::-1][:3]
             bars = axes[i, 2].bar(range(self.k_atoms), attention_np, color='steelblue')
             for k in top_3:
@@ -531,7 +531,7 @@ class RotoVisualizer:
 
             # Pose info text
             axes[i, 3].axis('off')
-            poses_np = poses.squeeze().cpu().numpy()
+            poses_np = poses[0].cpu().numpy()  # (K, 4)
             pose_text = "Top-3 Atoms:\n\n"
             for k in top_3:
                 _, _, theta, scale = poses_np[k]  # tx, ty not used in summary
