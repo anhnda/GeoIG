@@ -473,6 +473,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             phi_fine: (B, 2, H, W)
             v_coarse: (B, 2, 14, 14)
             v_fine: (B, 2, 112, 112)
+            h_i_enhanced: (B, 1, H, W) - Enhanced input (for loss computation)
         """
         B = h_i.shape[0]
 
@@ -486,11 +487,11 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
         # Step 2: COARSE alignment
         phi_coarse = self.warper(v_coarse)
-        h_coarse_aligned = self.warper.warp_image(h_i_blurred, phi_coarse)
+        h_coarse_aligned = self.warper.warp_image(h_i_blurred, phi_coarse, preserve_mass=False)
 
         # Step 3: FINE alignment
         phi_fine = self.warper(v_fine)
-        h_aligned = self.warper.warp_image(h_coarse_aligned, phi_fine)
+        h_aligned = self.warper.warp_image(h_coarse_aligned, phi_fine, preserve_mass=False)
 
         # Step 4: Update template bank
         if update_templates and class_ids is not None:
@@ -499,7 +500,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             else:
                 self._update_template_bank_avg(h_aligned, class_ids, cluster_assigned)
 
-        return h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine
+        return h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine, h_i_enhanced
 
     @torch.no_grad()
     def _update_template_bank_ot_signal_aware(self, h_aligned, class_ids, cluster_assigned,
@@ -1050,7 +1051,7 @@ class AdvancedLDDMMTrainer:
                 rgb_images = rgb_images.to(self.device, non_blocking=True)
 
             with torch.amp.autocast('cuda', enabled=self.use_amp):
-                h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine = self.model(
+                h_aligned, cluster_probs, phi_coarse, phi_fine, v_coarse, v_fine, h_i_enhanced = self.model(
                     saliency_maps,
                     class_ids=labels,
                     update_templates=True,
@@ -1059,7 +1060,9 @@ class AdvancedLDDMMTrainer:
 
                 batch_templates = self.model.get_batch_templates(labels)
 
-                losses = self.criterion(saliency_maps, h_aligned, batch_templates,
+                # CRITICAL: Compare h_aligned to h_i_enhanced (not original saliency_maps)
+                # because signal enhancement changes mass
+                losses = self.criterion(h_i_enhanced, h_aligned, batch_templates,
                                       cluster_probs, v_coarse, v_fine)
 
             self.optimizer.zero_grad()
