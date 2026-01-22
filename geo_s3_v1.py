@@ -538,13 +538,8 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
             del samples
 
-            # ABSOLUTE VALUE sparsity thresholding (no percentile - preserve all significant values)
-            # Only zero out truly negligible values (< 0.01)
-            barycenter = torch.where(
-                barycenter >= sparsity_threshold,
-                barycenter,
-                torch.zeros_like(barycenter)
-            )
+            # NO THRESHOLDING - let sparsity emerge naturally from the data
+            # The sparsity_match loss will preserve sparsity during alignment
 
             # Normalize
             barycenter_max = barycenter.max()
@@ -578,13 +573,8 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
             updated_template = (1 - eta) * self.templates[c, k] + eta * h_aligned[i]
 
-            # ABSOLUTE VALUE threshold - only remove truly negligible values
-            updated_template = torch.where(
-                updated_template >= sparsity_threshold,
-                updated_template,
-                torch.zeros_like(updated_template)
-            )
-
+            # NO THRESHOLDING - preserve all structure from aligned samples
+            # Normalize only
             if updated_template.max() > 0:
                 updated_template = updated_template / updated_template.max()
 
