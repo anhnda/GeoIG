@@ -20,7 +20,6 @@ Usage:
 """
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrow, Circle
@@ -32,7 +31,7 @@ from collections import defaultdict
 # Import Roto-LDDMM components
 import sys
 sys.path.append('.')
-from geo_roto import RotoLDDMM_Pipeline, SaliencyMapDataset
+from geo_roto import RotoLDDMM_Pipeline
 from full_classes import IMAGENET2012_CLASSES
 
 
@@ -103,7 +102,7 @@ class RotoVisualizer:
             print(f"Warning: Saliency directory not found: {self.saliency_dir}")
 
         # Get class names
-        self.class_names = {idx: name for idx, (wnid, name) in enumerate(IMAGENET2012_CLASSES.items())}
+        self.class_names = {idx: name for idx, (_, name) in enumerate(IMAGENET2012_CLASSES.items())}
 
         # Build class index for fast lookup
         self.cache_file = self.data_dir / "class_index_cache_roto.pkl"
@@ -142,16 +141,14 @@ class RotoVisualizer:
             print(f"  Warning: No batch files found in {self.saliency_dir}")
             return {}
 
-        for batch_idx, batch_file in enumerate(batch_files):
+        for batch_file in batch_files:
             batch_data = joblib.load(batch_file)
 
             for item_idx, item in enumerate(batch_data):
                 class_id = item['true_label']
                 class_index[class_id].append((str(batch_file), item_idx))
 
-            if (batch_idx + 1) % 10 == 0:
-                print(f"  Processed {batch_idx + 1}/{len(batch_files)} batch files...")
-
+            
         elapsed = time.time() - start_time
         total_samples = sum(len(samples) for samples in class_index.values())
         print(f"  ✓ Index built in {elapsed:.2f}s: {len(class_index)} classes, {total_samples} samples")
@@ -239,16 +236,18 @@ class RotoVisualizer:
         class_name = self.class_names.get(class_id, f"Class {class_id}")
 
         # Get atoms for this class
-        atoms = self.model.atom_bank.get_atoms_for_class(class_id).cpu().numpy()  # (K, 1, H, W)
-        if atoms.ndim == 3:
-            atoms = atoms.unsqueeze(1)  # (K, 1, H, W)
+        with torch.no_grad():
+            atoms_tensor = self.model.atom_bank.get_atoms_for_class(class_id)
+            atoms = atoms_tensor.detach().cpu().numpy()  # (K, 1, H, W)
+            if atoms.ndim == 3:
+                atoms = np.expand_dims(atoms, 1)  # (K, 1, H, W)
 
         # Get usage counts
         usage_counts = self.model.atom_bank.usage_counts
         if self.shared_atoms:
-            counts = usage_counts.cpu().numpy()  # (K,)
+            counts = usage_counts.detach().cpu().numpy()  # (K,)
         else:
-            counts = usage_counts[class_id].cpu().numpy()  # (K,)
+            counts = usage_counts[class_id].detach().cpu().numpy()  # (K,)
 
         # Create visualization
         ncols = min(5, self.k_atoms)
@@ -535,7 +534,7 @@ class RotoVisualizer:
             poses_np = poses.squeeze().cpu().numpy()
             pose_text = "Top-3 Atoms:\n\n"
             for k in top_3:
-                tx, ty, theta, scale = poses_np[k]
+                _, _, theta, scale = poses_np[k]  # tx, ty not used in summary
                 theta_deg = theta * 180 / np.pi
                 pose_text += f"Atom {k}: θ={theta_deg:.0f}°, s={scale:.2f}\n"
                 pose_text += f"  Attn: {attention_np[k]*100:.1f}%\n\n"
