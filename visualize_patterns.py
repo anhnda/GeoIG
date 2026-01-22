@@ -148,7 +148,7 @@ class PatternVisualizer:
                 v_res=v_res
             ).to(device)
 
-        # Load weights (handle torch.compile() prefix)
+        # Load weights (handle torch.compile() prefix and incompatible keys)
         state_dict = checkpoint['model_state_dict']
 
         # Strip _orig_mod. prefix if present (from torch.compile())
@@ -156,7 +156,25 @@ class PatternVisualizer:
             print("  Detected torch.compile() checkpoint - stripping _orig_mod. prefix...")
             state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
 
-        self.model.load_state_dict(state_dict)
+        # Filter out keys that don't exist in the current model (e.g., signal_enhancer from older versions)
+        model_keys = set(self.model.state_dict().keys())
+        filtered_state_dict = {}
+        incompatible_keys = []
+
+        for k, v in state_dict.items():
+            if k in model_keys:
+                filtered_state_dict[k] = v
+            else:
+                incompatible_keys.append(k)
+
+        if incompatible_keys:
+            print(f"  Skipping {len(incompatible_keys)} incompatible keys from checkpoint:")
+            for k in incompatible_keys[:5]:  # Show first 5
+                print(f"    - {k}")
+            if len(incompatible_keys) > 5:
+                print(f"    ... and {len(incompatible_keys) - 5} more")
+
+        self.model.load_state_dict(filtered_state_dict, strict=False)
         self.model.eval()
 
         # Templates are already in the model's buffers from state_dict
