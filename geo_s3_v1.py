@@ -995,20 +995,21 @@ class AdvancedLDDMMTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=5)
 
+        # MINIMAL LOSS - Only essentials, no fancy regularization
         self.criterion = AdvancedLDDMMLoss(
-            lambda_smooth=0.05,
-            lambda_entropy=0.3,  # FURTHER REDUCED: Allow more exploration
-            lambda_magnitude=0.00005,
-            lambda_diversity=5.0,  # INCREASED: Stronger penalty for cluster collapse
-            lambda_template_diversity=3.0,  # INCREASED: Force templates to differentiate
-            lambda_template_sparsity=0.5,  # REDUCED: Don't over-penalize sparse patterns
-            lambda_spatial_diversity=1.0,  # MODERATE: Some spatial separation needed
-            lambda_compactness=0.5,  # VERY LOW: Allow extended ostrich shapes
-            lambda_mass_conservation=20.0,
-            lambda_sparsity_match=5.0,
-            lambda_tv=0.2,  # VERY LOW: Allow fine details
-            lambda_jacobian=40.0,  # REDUCED: More deformation freedom
-            lambda_coarse_smooth=0.03
+            lambda_smooth=0.1,              # Basic smoothness
+            lambda_entropy=0.1,             # Minimal - let model decide
+            lambda_magnitude=0.00005,       # Prevent explosion
+            lambda_diversity=0.0,           # REMOVED - was causing loss increase
+            lambda_template_diversity=0.0,  # REMOVED - let templates converge naturally
+            lambda_template_sparsity=0.0,   # REMOVED - data is already sparse
+            lambda_spatial_diversity=0.0,   # REMOVED - not needed
+            lambda_compactness=0.0,         # REMOVED - constraining too much
+            lambda_mass_conservation=10.0,  # Keep moderate
+            lambda_sparsity_match=0.0,      # REMOVED - conflicting with alignment
+            lambda_tv=0.0,                  # REMOVED - allow any variation
+            lambda_jacobian=5.0,            # MINIMAL - just prevent inversions
+            lambda_coarse_smooth=0.05       # Keep for stability
         ).to(device)
 
         if self.use_amp:
