@@ -504,7 +504,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     @torch.no_grad()
     def _update_template_bank_ot_signal_aware(self, h_aligned, class_ids, cluster_assigned,
-                                              sparsity_percentile=30):
+                                              sparsity_threshold=0.01):
         """
         Update template bank using OT with signal-aware weighting.
 
@@ -538,10 +538,10 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
             del samples
 
-            # GENTLE sparsity thresholding (preserve more structure)
-            threshold = torch.quantile(barycenter.flatten(), sparsity_percentile / 100.0)
+            # ABSOLUTE VALUE sparsity thresholding (no percentile - preserve all significant values)
+            # Only zero out truly negligible values (< 0.01)
             barycenter = torch.where(
-                barycenter >= threshold,
+                barycenter >= sparsity_threshold,
                 barycenter,
                 torch.zeros_like(barycenter)
             )
@@ -565,7 +565,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             del barycenter
 
     @torch.no_grad()
-    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=30):
+    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_threshold=0.01):
         """Running average update with gentle sparsity."""
         B = h_aligned.shape[0]
 
@@ -578,9 +578,9 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
             updated_template = (1 - eta) * self.templates[c, k] + eta * h_aligned[i]
 
-            threshold = torch.quantile(updated_template.flatten(), sparsity_percentile / 100.0)
+            # ABSOLUTE VALUE threshold - only remove truly negligible values
             updated_template = torch.where(
-                updated_template >= threshold,
+                updated_template >= sparsity_threshold,
                 updated_template,
                 torch.zeros_like(updated_template)
             )
@@ -1007,17 +1007,17 @@ class AdvancedLDDMMTrainer:
 
         self.criterion = AdvancedLDDMMLoss(
             lambda_smooth=0.05,
-            lambda_entropy=0.5,
+            lambda_entropy=0.3,  # FURTHER REDUCED: Allow more exploration
             lambda_magnitude=0.00005,
-            lambda_diversity=3.0,  # REBALANCED: High enough to prevent collapse, low enough to allow learning
-            lambda_template_diversity=2.0,  # REBALANCED: Back to original
-            lambda_template_sparsity=1.0,
-            lambda_spatial_diversity=0.5,  # REDUCED: Was causing too much penalty
-            lambda_compactness=1.0,  # REDUCED: Allow more freedom
-            lambda_mass_conservation=20.0,  # REBALANCED: Was 100, way too high
-            lambda_sparsity_match=5.0,  # REBALANCED: Was 20, too aggressive
-            lambda_tv=0.3,  # REDUCED: Allow more variation
-            lambda_jacobian=50.0,  # REDUCED: Was 75, too restrictive
+            lambda_diversity=5.0,  # INCREASED: Stronger penalty for cluster collapse
+            lambda_template_diversity=3.0,  # INCREASED: Force templates to differentiate
+            lambda_template_sparsity=0.5,  # REDUCED: Don't over-penalize sparse patterns
+            lambda_spatial_diversity=1.0,  # MODERATE: Some spatial separation needed
+            lambda_compactness=0.5,  # VERY LOW: Allow extended ostrich shapes
+            lambda_mass_conservation=20.0,
+            lambda_sparsity_match=5.0,
+            lambda_tv=0.2,  # VERY LOW: Allow fine details
+            lambda_jacobian=40.0,  # REDUCED: More deformation freedom
             lambda_coarse_smooth=0.03
         ).to(device)
 
