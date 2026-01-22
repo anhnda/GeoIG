@@ -1007,17 +1007,17 @@ class AdvancedLDDMMTrainer:
 
         self.criterion = AdvancedLDDMMLoss(
             lambda_smooth=0.05,
-            lambda_entropy=0.5,  # Reduced from 1.0 to allow less confident assignments
+            lambda_entropy=0.5,
             lambda_magnitude=0.00005,
-            lambda_diversity=10.0,  # INCREASED from 2.0 to prevent cluster collapse
-            lambda_template_diversity=5.0,  # INCREASED from 2.0
-            lambda_template_sparsity=1.0,  # Reduced from 2.0 to preserve structure
-            lambda_spatial_diversity=2.0,  # Increased from 1.0
-            lambda_compactness=2.0,  # Keep low to allow extended structures
-            lambda_mass_conservation=100.0,  # CRITICAL: Enforce mass preservation
-            lambda_sparsity_match=20.0,  # INCREASED from 10.0 to preserve sparsity
-            lambda_tv=0.5,
-            lambda_jacobian=75.0,
+            lambda_diversity=3.0,  # REBALANCED: High enough to prevent collapse, low enough to allow learning
+            lambda_template_diversity=2.0,  # REBALANCED: Back to original
+            lambda_template_sparsity=1.0,
+            lambda_spatial_diversity=0.5,  # REDUCED: Was causing too much penalty
+            lambda_compactness=1.0,  # REDUCED: Allow more freedom
+            lambda_mass_conservation=20.0,  # REBALANCED: Was 100, way too high
+            lambda_sparsity_match=5.0,  # REBALANCED: Was 20, too aggressive
+            lambda_tv=0.3,  # REDUCED: Allow more variation
+            lambda_jacobian=50.0,  # REDUCED: Was 75, too restrictive
             lambda_coarse_smooth=0.03
         ).to(device)
 
