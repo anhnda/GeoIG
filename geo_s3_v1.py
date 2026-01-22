@@ -1013,7 +1013,7 @@ class AdvancedLDDMMTrainer:
             lambda_template_sparsity=2.0,  # Reduced from 7.0
             lambda_spatial_diversity=1,
             lambda_compactness=2.0,  # Reduced from 15.0
-            lambda_mass_conservation=5.0,
+            lambda_mass_conservation=100.0,  # CRITICAL: Increased from 5.0 to enforce mass preservation
             lambda_sparsity_match=10.0,
             lambda_tv=0.5,
             lambda_jacobian=75.0,
