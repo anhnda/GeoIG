@@ -452,9 +452,11 @@ class PatternVisualizer:
         for k in range(self.k_subpatterns):
             ax = axes[k]
 
-            # Plot template with normalization
+            # Plot template with aggressive normalization for sparse patterns
             template = templates[k, 0]  # (H, W)
-            vmax = template.max() if template.max() > 0 else 1.0
+            # Use 99th percentile to avoid extreme outliers dominating the scale
+            vmax = np.percentile(template, 99) if template.max() > 0 else 1.0
+            vmax = max(vmax, template.max() * 0.1)  # Ensure we capture at least 10% of max
             im = ax.imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
 
             # Add colorbar
@@ -462,8 +464,9 @@ class PatternVisualizer:
 
             # Title with usage count and max value
             usage_pct = counts[k] / counts.sum() * 100 if counts.sum() > 0 else 0
-            ax.set_title(f'Pattern {k} (max={vmax:.3f})\nUsage: {int(counts[k])} ({usage_pct:.1f}%)',
-                        fontsize=9)
+            sparsity = (template > 0.01).sum() / template.size * 100
+            ax.set_title(f'Pattern {k} (max={template.max():.3f})\nUsage: {int(counts[k])} ({usage_pct:.1f}%) | Active: {sparsity:.1f}%',
+                        fontsize=8)
             ax.axis('off')
 
         plt.tight_layout()
@@ -627,11 +630,13 @@ class PatternVisualizer:
             # Pattern template
             ax = fig.add_subplot(gs[1, 3+i]) if i < 2 else fig.add_subplot(gs[2, 0])
             template = templates[k, 0]
-            # Normalize template for visualization
-            vmax = template.max() if template.max() > 0 else 1.0
+            # Aggressive normalization for sparse templates
+            vmax = np.percentile(template, 99) if template.max() > 0 else 1.0
+            vmax = max(vmax, template.max() * 0.1)  # Ensure we capture at least 10% of max
             im = ax.imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
-            ax.set_title(f'Pattern {k}\n({cluster_probs_np[k]*100:.1f}%) max={vmax:.3f}',
-                        fontsize=9, fontweight='bold')
+            sparsity = (template > 0.01).sum() / template.size * 100
+            ax.set_title(f'Pattern {k}\n({cluster_probs_np[k]*100:.1f}%) max={template.max():.3f}\nActive: {sparsity:.1f}%',
+                        fontsize=8, fontweight='bold')
             ax.axis('off')
             plt.colorbar(im, ax=ax, fraction=0.046)
 
@@ -736,10 +741,21 @@ class PatternVisualizer:
 
             # Assigned pattern
             template = self.model.templates[class_id, cluster_assigned].squeeze().cpu().numpy()
-            # Normalize template for better visualization (vmin=0, vmax=template's max)
-            vmax = template.max() if template.max() > 0 else 1.0
-            axes[i, col].imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
-            axes[i, col].set_title(f'Pattern {cluster_assigned} Template\n(max={vmax:.3f})', fontsize=9)
+
+            # Debug: print template stats for first sample
+            if i == 0:
+                print(f"\nPattern {cluster_assigned} Statistics:")
+                print(f"  Shape: {template.shape}")
+                print(f"  Min: {template.min():.6f}, Max: {template.max():.6f}, Mean: {template.mean():.6f}")
+                print(f"  Zeros: {(template == 0).sum() / template.size * 100:.2f}%")
+                print(f"  Values > 0.01: {(template > 0.01).sum() / template.size * 100:.2f}%")
+                print(f"  99th percentile: {np.percentile(template, 99):.6f}")
+
+            # Aggressive normalization: use 99th percentile to handle sparse templates
+            vmax = np.percentile(template, 99) if template.max() > 0 else 1.0
+            vmax = max(vmax, template.max() * 0.1)  # Ensure we capture at least 10% of max
+            im_template = axes[i, col].imshow(template, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
+            axes[i, col].set_title(f'Pattern {cluster_assigned} Template\n(max={template.max():.3f}, vmax={vmax:.3f})', fontsize=8)
             axes[i, col].axis('off')
             col += 1
 
