@@ -74,12 +74,14 @@ class AdaptiveSignalEnhancer(nn.Module):
         """
         Args:
             saliency: (B, 1, H, W) - Input saliency map
-            enhance_mode: 'log_power', 'percentile', 'local_contrast', or 'combined'
+            enhance_mode: 'log_power', 'percentile', 'local_contrast', 'combined', or 'none'
 
         Returns:
             enhanced: (B, 1, H, W) - Enhanced saliency map
         """
-        if enhance_mode == 'log_power':
+        if enhance_mode == 'none':
+            return saliency
+        elif enhance_mode == 'log_power':
             return self._log_power_transform(saliency)
         elif enhance_mode == 'percentile':
             return self._percentile_normalize(saliency)
@@ -423,7 +425,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     def __init__(self, num_classes=1000, k_subpatterns=10, img_res=(224, 224),
                  device='cuda', temperature=0.1, use_ot=True,
-                 enhance_mode='combined', alpha=0.5):
+                 enhance_mode='log_power', alpha=0.5):
         super().__init__()
         self.num_classes = num_classes
         self.K = k_subpatterns
@@ -501,7 +503,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
 
     @torch.no_grad()
     def _update_template_bank_ot_signal_aware(self, h_aligned, class_ids, cluster_assigned,
-                                              sparsity_percentile=75):
+                                              sparsity_percentile=50):
         """
         Update template bank using OT with signal-aware weighting.
 
@@ -562,7 +564,7 @@ class AdvancedLDDMM_Pipeline(nn.Module):
             del barycenter
 
     @torch.no_grad()
-    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=75):
+    def _update_template_bank_avg(self, h_aligned, class_ids, cluster_assigned, sparsity_percentile=50):
         """Running average update with gentle sparsity."""
         B = h_aligned.shape[0]
 
@@ -1202,9 +1204,9 @@ USAGE:
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--use_ot', action='store_true')
-    parser.add_argument('--enhance_mode', type=str, default='combined',
-                       choices=['log_power', 'percentile', 'local_contrast', 'combined'],
-                       help='Signal enhancement mode (default: combined)')
+    parser.add_argument('--enhance_mode', type=str, default='log_power',
+                       choices=['log_power', 'percentile', 'local_contrast', 'combined', 'none'],
+                       help='Signal enhancement mode (default: log_power, use none to disable)')
     parser.add_argument('--alpha', type=float, default=0.5,
                        help='Power for log-power transform (default: 0.5)')
     parser.add_argument('--max_samples_per_class', type=int, default=None)
