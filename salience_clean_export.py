@@ -53,7 +53,7 @@ IMAGENET_SAMPLED_DIR = Path("/data/imagenet1k_sampled")
 SALIENCY_OUTPUT_DIR = Path("./data/saliency_imagenet1k_resnet50_100")
 
 IMAGES_PER_CLASS = 100
-NUM_CLASSES = 1000
+NUM_CLASSES = 20
 
 # ==========================================
 # Enhanced Integrated Gradients with Expected Gradients
@@ -758,7 +758,7 @@ EXAMPLES:
                        help='Batch size for processing (default: 16, unused in current implementation)')
     parser.add_argument('--ig_steps', type=int, default=50,
                        help='Number of integration steps for IG (default: 50)')
-    parser.add_argument('--output_dir', type=str, default='./data/saliency_imagenet1k_resnet50_100',
+    parser.add_argument('--output_dir', type=str, default='./data/saliency_imagenet1k_resnet50_100_sub20',
                        help='Output directory for saliency maps')
     parser.add_argument('--use_mean', action='store_true',
                        help='Use Expected Gradients (average over multiple baselines: black, white, gaussian, blur, background)')
