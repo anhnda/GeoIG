@@ -398,22 +398,28 @@ class AtomBank(nn.Module):
             class_ids: (B,) - Class indices
 
         Returns:
-            atoms: (B, K, 1, H_atom, W_atom) - Atom templates
+            atoms: (B, K, 1, H_atom, W_atom) - Atom templates (non-negative)
         """
         if self.shared_atoms:
             # All classes use the same atoms
             B = class_ids.shape[0]
-            return self.atoms.unsqueeze(0).expand(B, -1, -1, -1, -1)
+            atoms = self.atoms.unsqueeze(0).expand(B, -1, -1, -1, -1)
         else:
             # Each class has its own atoms
-            return self.atoms[class_ids]
+            atoms = self.atoms[class_ids]
+
+        # CRITICAL: Ensure atoms are non-negative (saliency values must be >= 0)
+        return F.relu(atoms)
 
     def get_atoms_for_class(self, class_id):
-        """Get all atoms for a specific class."""
+        """Get all atoms for a specific class (non-negative)."""
         if self.shared_atoms:
-            return self.atoms
+            atoms = self.atoms
         else:
-            return self.atoms[class_id]
+            atoms = self.atoms[class_id]
+
+        # Ensure atoms are non-negative
+        return F.relu(atoms)
 
 
 # ==========================================
@@ -732,8 +738,12 @@ class RotoLDDMMLoss(nn.Module):
         y_coords = torch.arange(H, device=atoms.device, dtype=torch.float32).view(1, 1, 1, H, 1)
         x_coords = torch.arange(W, device=atoms.device, dtype=torch.float32).view(1, 1, 1, 1, W)
 
-        # Normalize atoms as probability distributions
-        atoms_norm = atoms / (atoms.sum(dim=(2, 3, 4), keepdim=True) + 1e-8)
+        # Use absolute values to ensure positive mass (atoms can be negative during training)
+        atoms_abs = torch.abs(atoms)
+
+        # Normalize as probability distributions (now guaranteed positive)
+        total_mass = atoms_abs.sum(dim=(2, 3, 4), keepdim=True)
+        atoms_norm = atoms_abs / (total_mass + 1e-8)
 
         # Compute centers of mass
         center_y = (atoms_norm * y_coords).sum(dim=(2, 3, 4))  # (B, K)
