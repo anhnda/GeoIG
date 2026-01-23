@@ -813,18 +813,18 @@ class RotoLDDMMTrainer:
         # Manual LR scheduling (no auto scheduler)
         self.base_lr = lr
 
-        # V2 Loss optimized for dots
+        # V2 Loss optimized for dots (Anti-Collapse + Scatter-Tolerant)
         self.criterion = RotoLDDMMLoss(
             lambda_reconstruction=1.0,
-            lambda_atom_sparsity=3.0,          # REDUCED: allow more atom detail (was 5.0)
+            lambda_atom_sparsity=2.0,          # REDUCED: allow atoms to capture regions (was 3.0)
             lambda_atom_diversity=5.0,         # INCREASED: force different atoms (was 2.0)
             lambda_pose_reg=0.01,              # Low: flexible poses
             lambda_attention_sparsity=0.5,     # REDUCED: allow multiple atoms (was 3.0)
             lambda_local_smooth=0.5,           # INCREASED: smooth warps
             lambda_mass_conservation=1.0,      # Standard
-            lambda_atom_tv=0.5,                # INCREASED: encourage connected parts (was 0.1)
-            lambda_atom_compactness=0.5,       # INCREASED: encourage part-like shapes (was 0.05)
-            lambda_atom_usage_balance=2.0      # NEW: prevent mode collapse
+            lambda_atom_tv=0.2,                # MODERATE: some smoothness (was 0.5)
+            lambda_atom_compactness=0.01,      # VERY LOW: allow scattered atoms (was 0.5!)
+            lambda_atom_usage_balance=3.0      # INCREASED: stronger anti-collapse (was 2.0)
         ).to(device)
 
         self.history = defaultdict(list)
@@ -837,15 +837,15 @@ class RotoLDDMMTrainer:
         print(f"  Stage 2 - Discovery  (Epochs 6-20):  σ=2.0, High LR")
         print(f"  Stage 3 - Refinement (Epochs 21-40): σ→0.5, Moderate LR")
         print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ=0, Low LR")
-        print(f"\nLoss Weights (V2 - Anti-Collapse Configuration):")
+        print(f"\nLoss Weights (V2 - Anti-Collapse + Scatter-Tolerant):")
         print(f"  - Reconstruction: 1.0")
-        print(f"  - Atom Sparsity: 3.0 (REDUCED - allow detail)")
-        print(f"  - Atom Diversity: 5.0 (INCREASED - prevent collapse)")
-        print(f"  - Attention Sparsity: 0.5 (REDUCED - allow multi-atom)")
+        print(f"  - Atom Sparsity: 2.0 (allow atoms to capture regions)")
+        print(f"  - Atom Diversity: 5.0 (STRONG - prevent collapse)")
+        print(f"  - Attention Sparsity: 0.5 (allow multi-atom usage)")
         print(f"  - Local Smooth: 0.5")
-        print(f"  - Atom TV: 0.5 (INCREASED - connected parts)")
-        print(f"  - Atom Compactness: 0.5 (INCREASED - part-like shapes)")
-        print(f"  - Usage Balance: 2.0 (NEW - force all atoms to be used)")
+        print(f"  - Atom TV: 0.2 (moderate smoothness)")
+        print(f"  - Atom Compactness: 0.01 (VERY LOW - allow scattered atoms)")
+        print(f"  - Usage Balance: 3.0 (STRONG - force all atoms used)")
         print(f"{'='*80}\n")
 
     def get_stage_config(self, epoch):
