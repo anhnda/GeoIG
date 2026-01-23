@@ -11,12 +11,12 @@ This script visualizes:
 
 Usage:
     # Visualize class 0 atoms and decomposition
-    python visualize_roto.py --checkpoint checkpoints_roto/roto_lddmm_model_final.pth --class_id 0
+    python visualize_roto.py --checkpoint checkpoints_roto_v2/roto_lddmm_model_final.pth --class_id 0
 
     # Visualize specific class with custom data
-    python visualize_roto.py --checkpoint checkpoints_roto/roto_lddmm_model_epoch_10.pth \
-                             --class_id 281 \
-                             --data_dir ./data/saliency_imagenet1k_resnet50_100
+    python visualize_roto.py --checkpoint checkpoints_roto_v2/roto_lddmm_model_epoch_10.pth \
+                             --class_id 5 \
+                             --data_dir ./data/saliency_imagenet_sub_c20_s100
 """
 
 import torch
@@ -31,7 +31,7 @@ from collections import defaultdict
 # Import Roto-LDDMM components
 import sys
 sys.path.append('.')
-from geo_roto import RotoLDDMM_Pipeline
+from geo_roto_v2 import RotoLDDMM_Pipeline
 from full_classes import IMAGENET2012_CLASSES
 
 
@@ -52,7 +52,7 @@ class RotoVisualizer:
             if atoms.dim() == 4:
                 # Shared atoms: (K, 1, H, W)
                 self.shared_atoms = True
-                self.num_classes = 1000  # Default
+                self.num_classes = 20  # Default
                 self.k_atoms = atoms.shape[0]
                 self.atom_res = (atoms.shape[2], atoms.shape[3])
             else:
@@ -555,10 +555,10 @@ def main():
     parser = argparse.ArgumentParser(
         description='Visualize Roto-LDDMM part-based decomposition'
     )
-    parser.add_argument('--checkpoint', type=str, default='checkpoints_roto/roto_lddmm_model_final.pth',
+    parser.add_argument('--checkpoint', type=str, default='checkpoints_roto_v2/roto_lddmm_model_final.pth',
                        help='Path to Roto-LDDMM checkpoint')
     parser.add_argument('--data_dir', type=str,
-                       default='./data/saliency_imagenet1k_resnet50_100',
+                       default='./data/saliency_imagenet_sub_c20_s100',
                        help='Directory with saliency maps')
     parser.add_argument('--class_id', type=int, default=0,
                        help='Class ID to visualize')
@@ -566,7 +566,7 @@ def main():
                        help='Sample index for decomposition')
     parser.add_argument('--num_samples', type=int, default=4,
                        help='Number of samples for comparison')
-    parser.add_argument('--output_dir', type=str, default='./visualizations_roto',
+    parser.add_argument('--output_dir', type=str, default='./visualizations_roto_v2',
                        help='Output directory for saved figures')
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device to use (cuda/cpu)')
