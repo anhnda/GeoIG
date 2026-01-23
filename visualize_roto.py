@@ -552,12 +552,18 @@ class RotoVisualizer:
 
             # Pose info text
             axes[i, 3].axis('off')
-            poses_np = poses[0].cpu().numpy()  # (K, 4)
+            poses_np = poses[0].cpu().numpy()  # (K, 5) or (K, 4)
+            is_anisotropic = poses_np.shape[0] > 0 and poses_np.shape[1] == 5
             pose_text = "Top-3 Atoms:\n\n"
             for k in top_3:
-                _, _, theta, scale = poses_np[k]  # tx, ty not used in summary
-                theta_deg = theta * 180 / np.pi
-                pose_text += f"Atom {k}: θ={theta_deg:.0f}°, s={scale:.2f}\n"
+                if is_anisotropic:
+                    _, _, theta, sx, sy = poses_np[k]  # tx, ty not used in summary
+                    theta_deg = theta * 180 / np.pi
+                    pose_text += f"Atom {k}: θ={theta_deg:.0f}°, sx={sx:.2f}, sy={sy:.2f}\n"
+                else:
+                    _, _, theta, scale = poses_np[k]  # tx, ty not used in summary
+                    theta_deg = theta * 180 / np.pi
+                    pose_text += f"Atom {k}: θ={theta_deg:.0f}°, s={scale:.2f}\n"
                 pose_text += f"  Attn: {attention_np[k]*100:.1f}%\n\n"
             axes[i, 3].text(0.1, 0.9, pose_text, fontsize=10, family='monospace',
                           verticalalignment='top', transform=axes[i, 3].transAxes)
