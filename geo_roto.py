@@ -667,15 +667,19 @@ class RotoLDDMMLoss(nn.Module):
         """
         Encourage sparse attention (few active atoms per image).
 
-        Uses L1 penalty to encourage most atoms to have zero attention.
-        This is more direct than entropy for achieving sparsity.
+        Uses negative entropy: lower entropy means peaky distribution
+        (1-2 dominant atoms) rather than uniform distribution.
 
         Args:
-            attention: (B, K) - Attention weights
+            attention: (B, K) - Attention weights (softmax normalized)
         """
-        # L1 penalty encourages most weights to be zero
-        # Combined with softmax, this pushes to have 1-2 dominant atoms
-        return torch.abs(attention).sum(dim=1).mean()
+        # Compute entropy: H = -sum(p * log(p))
+        # Add epsilon to avoid log(0)
+        entropy = -(attention * torch.log(attention + 1e-10)).sum(dim=1)
+
+        # Minimize entropy to encourage sparse attention
+        # (peaky distribution = low entropy)
+        return entropy.mean()
 
     def local_smoothness_loss(self, v_local):
         """
