@@ -1041,9 +1041,9 @@ USAGE:
         """
     )
     parser.add_argument('--data_dir', type=str,
-                       default='./data/saliency_imagenet1k_resnet50_100',
+                       default='./data/saliency_imagenet_sub_c20_s100',
                        help='Directory with saliency maps')
-    parser.add_argument('--num_classes', type=int, default=1000,
+    parser.add_argument('--num_classes', type=int, default=20,
                        help='Number of classes')
     parser.add_argument('--k_atoms', type=int, default=15,
                        help='Number of atoms per class')
