@@ -544,11 +544,12 @@ class RotoLDDMMLoss(nn.Module):
     """
     Loss functions for Roto-LDDMM V2: Optimized for dot-point IG maps.
 
-    Key Changes from V2.0 to V2.1:
-    1. Re-introduced SOFT compactness (0.3) to group dots into parts
-    2. Re-enabled TV (0.5) to encourage connected structures
-    3. Added overlap penalty to prevent atom collapse
-    4. Balanced reconstruction signal strength
+    Key Changes V2.3 (ANTI-COLLAPSE UPDATE):
+    1. Weighted reconstruction loss: 10× weight for positive signal vs zeros
+    2. Peak penalty: Prevent atoms from collapsing to sharp dots
+    3. Removed compactness penalty: Allow atoms to spread naturally
+    4. Increased TV (0.1): Encourage smooth, spread-out atoms
+    5. Minimum blur (σ≥0.5): Maintain gradient signal for diffuse regions
     """
 
     def __init__(self,
@@ -563,7 +564,8 @@ class RotoLDDMMLoss(nn.Module):
                  lambda_atom_compactness=0.3,       # RE-INTRODUCED: force dots to form a "part"
                  lambda_atom_usage_balance=2.0,     # Prevent mode collapse
                  lambda_atom_overlap=1.0,           # NEW: prevent atoms from stacking
-                 lambda_atom_peak_penalty=0.5):     # NEW: prevent overly peaked atoms
+                 lambda_atom_peak_penalty=0.5,      # NEW: prevent overly peaked atoms
+                 signal_weight=10.0):               # NEW: weight for positive signal in reconstruction
         super().__init__()
         self.lambda_reconstruction = lambda_reconstruction
         self.lambda_atom_sparsity = lambda_atom_sparsity
@@ -577,10 +579,42 @@ class RotoLDDMMLoss(nn.Module):
         self.lambda_atom_usage_balance = lambda_atom_usage_balance
         self.lambda_atom_overlap = lambda_atom_overlap
         self.lambda_atom_peak_penalty = lambda_atom_peak_penalty
+        self.signal_weight = signal_weight
 
-    def reconstruction_loss(self, h_original, h_composed):
-        """MSE between input and composed pattern."""
-        return F.mse_loss(h_composed, h_original)
+    def reconstruction_loss(self, h_original, h_composed, signal_weight=10.0):
+        """
+        Weighted MSE between input and composed pattern.
+
+        Gives higher weight to positive signal regions (where h_original > 0)
+        to prevent the model from just matching the easy zero regions.
+
+        Args:
+            h_original: (B, 1, H, W) - Target saliency maps
+            h_composed: (B, 1, H, W) - Reconstructed saliency maps
+            signal_weight: float - Weight multiplier for positive signal regions (default: 10.0)
+
+        Returns:
+            Weighted MSE loss
+        """
+        # Compute per-pixel squared error
+        squared_error = (h_composed - h_original) ** 2
+
+        # Create weight map: higher weight for positive signal regions
+        # Use a threshold to identify signal vs background (small values might be noise)
+        signal_threshold = h_original.max() * 0.01  # 1% of max value
+        signal_mask = (h_original > signal_threshold).float()
+
+        # Weight map: 1.0 for background, signal_weight for signal regions
+        weight_map = 1.0 + (signal_weight - 1.0) * signal_mask
+
+        # Weighted MSE
+        weighted_error = squared_error * weight_map
+
+        # Normalize by total weight to keep loss magnitude comparable
+        total_weight = weight_map.sum()
+        loss = weighted_error.sum() / (total_weight + 1e-8)
+
+        return loss
 
     def atom_sparsity_loss(self, atoms):
         """Encourage atoms to be sparse (lots of zeros)."""
@@ -777,7 +811,7 @@ class RotoLDDMMLoss(nn.Module):
         Returns:
             loss: Scalar - Overlap penalty (minimize)
         """
-        B, K, _, H, W = atoms_transformed.shape
+        B, K, _, _, _ = atoms_transformed.shape
 
         if K <= 1:
             return torch.tensor(0.0, device=atoms_transformed.device)
@@ -817,7 +851,7 @@ class RotoLDDMMLoss(nn.Module):
         Returns:
             loss: Scalar - Peak penalty (minimize)
         """
-        B, K, _, H, W = atoms.shape
+        B, K, _, _, _ = atoms.shape
 
         # Flatten spatial dimensions
         atoms_flat = atoms.view(B * K, -1)  # (B*K, H*W)
@@ -854,7 +888,7 @@ class RotoLDDMMLoss(nn.Module):
         Returns:
             loss_dict: Dictionary of loss components
         """
-        loss_recon = self.reconstruction_loss(h_original, h_composed)
+        loss_recon = self.reconstruction_loss(h_original, h_composed, signal_weight=self.signal_weight)
         loss_atom_sparse = self.atom_sparsity_loss(atoms)
         loss_atom_div = self.atom_diversity_loss(atoms)
         loss_pose_reg = self.pose_regularization_loss(poses)
@@ -910,14 +944,19 @@ class RotoLDDMMLoss(nn.Module):
 
 class RotoLDDMMTrainer:
     """
-    Trainer for Roto-LDDMM V2 with 4-stage Gaussian annealing.
+    Trainer for Roto-LDDMM V2.3 with 4-stage Gaussian annealing (anti-collapse).
 
     Training Stages:
     ----------------
     1. Warmup (1-5):       Atoms frozen, predictor learns with σ=2.5
     2. Discovery (6-20):   σ=2.0, atoms move to signal regions, high LR
-    3. Refinement (21-40): σ→0.5, local warps enabled, moderate LR
-    4. Finalize (41-50):   σ=0, exact dot patterns, low LR
+    3. Refinement (21-40): σ→1.0 (slower drop), local warps enabled, moderate LR
+    4. Finalize (41-50):   σ→0.5 (maintain minimum blur for diffuse signal), low LR
+
+    V2.3 Features:
+    - Weighted reconstruction: 10× weight for positive signal vs background
+    - Peak penalty: Prevents atoms from collapsing to sharp dots
+    - No compactness penalty: Allows atoms to spread naturally
     """
 
     def __init__(self, model, train_loader, val_loader=None,
@@ -965,13 +1004,14 @@ class RotoLDDMMTrainer:
             lambda_atom_compactness=0.0,       # REMOVED: allow atoms to spread naturally (was 0.005)
             lambda_atom_usage_balance=2.0,     # Prevent mode collapse
             lambda_atom_overlap=0.1,           # REDUCED: neck can be near head (was 1.0)
-            lambda_atom_peak_penalty=0.5       # NEW: prevent overly peaked atoms (encourage distribution)
+            lambda_atom_peak_penalty=0.5,      # NEW: prevent overly peaked atoms (encourage distribution)
+            signal_weight=10.0                 # NEW: 10× weight for positive signal regions in reconstruction
         ).to(device)
 
         self.history = defaultdict(list)
 
         print(f"\n{'='*80}")
-        print(f"Roto-LDDMM V2.2 Trainer: STRUCTURE OVER SMOOTHNESS")
+        print(f"Roto-LDDMM V2.3 Trainer: ANTI-COLLAPSE WITH WEIGHTED RECONSTRUCTION")
         print(f"{'='*80}")
         print(f"\n4-Stage Training Schedule (UPDATED ANNEALING):")
         print(f"  Stage 1 - Warmup     (Epochs 1-5):   σ=2.5, Atoms Frozen")
@@ -980,6 +1020,7 @@ class RotoLDDMMTrainer:
         print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ→0.5 (maintain minimum blur)")
         print(f"\nLoss Weights (V2.3 - ANTI-COLLAPSE UPDATE):")
         print(f"  - Reconstruction: 15.0 ★★★ CRITICAL - 15× increase to force dot matching!")
+        print(f"    └─ Signal Weight: 10.0 (prioritize positive signal over background zeros)")
         print(f"  - Atom TV: 0.1 (encourage smooth/spread atoms, was 0.01)")
         print(f"  - Atom Compactness: 0.0 (DISABLED - allow atoms to spread naturally)")
         print(f"  - Atom Peak Penalty: 0.5 (NEW - prevent peaked/collapsed atoms)")
@@ -989,13 +1030,16 @@ class RotoLDDMMTrainer:
         print(f"  - Atom Diversity: 2.0 (force different atoms)")
         print(f"  - Local Smooth: 0.8 (allow organic curves)")
         print(f"  - Usage Balance: 2.0 (prevent collapse)")
-        print(f"\nPhilosophy Change (V2.1 → V2.2):")
+        print(f"\nPhilosophy Evolution:")
         print(f"  V2.1: Group dots into smooth, compact parts → Result: Blobs, not birds")
-        print(f"  V2.2: Let reconstruction dominate, atoms stretch to match → Goal: Skeletal structure")
+        print(f"  V2.2: Let reconstruction dominate, atoms stretch to match → Result: Still collapsed")
+        print(f"  V2.3: Weighted reconstruction + anti-collapse penalties → Goal: Spread atoms, match signal")
         print(f"\nKey Features:")
+        print(f"  - Weighted reconstruction: 10× priority for signal regions over background")
+        print(f"  - Peak penalty: Forces atoms to distribute mass evenly (not concentrated)")
+        print(f"  - Minimum blur (σ≥0.5): Maintains gradient signal for diffuse regions")
         print(f"  - Anisotropic scaling (sx, sy) for elongated structures")
-        print(f"  - Persistent Gaussian scaffolding (σ ≥ 1.0 until epoch 40)")
-        print(f"  - Minimal smoothness constraints - let atoms stretch/fragment if needed")
+        print(f"  - No compactness penalty: Atoms can spread naturally")
         print(f"  - Multiple atoms collaborate (6-8 instead of 3-4) to build complex shapes")
         print(f"{'='*80}\n")
 
