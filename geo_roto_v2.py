@@ -584,21 +584,28 @@ class RotoLDDMMLoss(nn.Module):
 
     def attention_sparsity_loss(self, attention):
         """
-        Encourage sparse attention (few active atoms per image).
+        Encourage moderate attention diversity (3-5 active atoms per image).
 
-        Uses negative entropy: lower entropy means peaky distribution
-        (1-2 dominant atoms) rather than uniform distribution.
+        ANTI-COLLAPSE FIX: Instead of minimizing entropy (which causes collapse
+        to 1 atom), we target an entropy corresponding to ~3-5 atoms.
+
+        For K atoms:
+        - Entropy = 0: Only 1 atom active (COLLAPSE!)
+        - Entropy = log(K): All K atoms equally active (too diffuse)
+        - Entropy = log(4): ~4 atoms active (SWEET SPOT)
 
         Args:
             attention: (B, K) - Attention weights (softmax normalized)
         """
         # Compute entropy: H = -sum(p * log(p))
-        # Add epsilon to avoid log(0)
         entropy = -(attention * torch.log(attention + 1e-10)).sum(dim=1)
 
-        # Minimize entropy to encourage sparse attention
-        # (peaky distribution = low entropy)
-        return entropy.mean()
+        # Target entropy: log(4) ≈ 1.386 (encourages ~4 atoms per sample)
+        # This prevents both collapse (H→0) and over-diffusion (H→log(K))
+        target_entropy = np.log(4.0)
+
+        # Penalize deviation from target
+        return ((entropy - target_entropy) ** 2).mean()
 
     def local_smoothness_loss(self, v_local):
         """
@@ -841,7 +848,7 @@ class RotoLDDMMTrainer:
         print(f"  - Reconstruction: 1.0")
         print(f"  - Atom Sparsity: 2.0 (allow atoms to capture regions)")
         print(f"  - Atom Diversity: 5.0 (STRONG - prevent collapse)")
-        print(f"  - Attention Sparsity: 0.5 (allow multi-atom usage)")
+        print(f"  - Attention Diversity: 0.5 (target ~4 atoms per sample)")
         print(f"  - Local Smooth: 0.5")
         print(f"  - Atom TV: 0.2 (moderate smoothness)")
         print(f"  - Atom Compactness: 0.01 (VERY LOW - allow scattered atoms)")
@@ -969,7 +976,7 @@ class RotoLDDMMTrainer:
                 'loss': losses['total'].item(),
                 'recon': losses['reconstruction'].item(),
                 'tv': losses['atom_tv'].item(),
-                'attn_sp': losses['attention_sparsity'].item()
+                'attn_div': losses['attention_sparsity'].item()
             })
 
             if batch_idx % 50 == 0:
@@ -1003,7 +1010,7 @@ class RotoLDDMMTrainer:
             print(f"\nEpoch {epoch}/{num_epochs} Summary [{config['stage_name']}]:")
             print(f"  Total Loss: {avg_losses['total']:.4f}")
             print(f"  Reconstruction: {avg_losses['reconstruction']:.4f}")
-            print(f"  Attention Sparsity (Entropy): {avg_losses['attention_sparsity']:.4f}")
+            print(f"  Attention Diversity: {avg_losses['attention_sparsity']:.4f} (target ~0, entropy~1.4)")
             print(f"  Usage Balance: {avg_losses['usage_balance']:.6f} (low=uniform usage)")
             print(f"  Atom Sparsity: {avg_losses['atom_sparsity']:.4f}")
             print(f"  Atom Diversity: {avg_losses['atom_diversity']:.4f}")
