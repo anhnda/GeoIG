@@ -1,36 +1,47 @@
 """
-Roto-LDDMM V2: Optimized for Dot-Point IG Maps with Gaussian Annealing
-========================================================================
-
-This version is specifically designed for scattered dot-point Integrated Gradients maps,
-which present unique challenges compared to smooth saliency maps.
-
-Key Problem: Scattered Dot-Point Structure
+Roto-LDDMM V2.2: STRUCTURE OVER SMOOTHNESS
 ===========================================
-IG maps consist of isolated high-frequency spikes (dots) rather than smooth blobs.
-Standard training fails because:
-- No gradient signal for atoms to find dots (binary "hit or miss")
-- TV/compactness losses fight the natural scattered structure
-- Softmax averaging washes out sharp peaks
 
-V2 Innovations
-==============
-1. **Gaussian Annealing Strategy**:
-   - Early epochs (1-20): Blur input (σ=2-3) to create "hills" from "spikes"
-   - Middle epochs (21-40): Gradually reduce blur (σ→0.5) for refinement
-   - Final epochs (41-50): No blur, learn exact dot patterns
+Evolution from V2.0 → V2.2:
+- V2.0: Captured dots perfectly but lost topological meaning (fragmented textures)
+- V2.1: Re-introduced compactness to group dots → Result: Blobs, not anatomical structures
+- V2.2: **RECONSTRUCTION DOMINATES** - let atoms stretch/deform to match skeletal structure
 
-2. **Loss Rebalancing for Dots**:
-   - TV Loss: DISABLED (dots should be sharp, not smooth)
-   - Compactness: DISABLED (dots are naturally scattered)
-   - Local Smooth: INCREASED (keep warps smooth)
-   - Max Composition: Preserves peak intensities (not softmax averaging)
+Core Philosophy (V2.2)
+======================
+**Problem**: V2.1 produced smooth blobs instead of bird-like skeletal structures because
+smoothness priors (TV, compactness) dominated over reconstruction signal.
 
-3. **4-Stage Training Schedule**:
-   Stage 1 (Warmup, 1-5):     Atoms frozen, train pose predictor
-   Stage 2 (Discovery, 6-20): σ=2.0, atoms learn to find regions
-   Stage 3 (Refinement, 21-40): σ→0.5, local warps for fine detail
-   Stage 4 (Finalize, 41-50):  No blur, bake exact dot templates
+**Solution**: Shift power balance to reconstruction:
+- Reconstruction weight: 1.0 → 15.0 (15× increase)
+- TV loss: 0.5 → 0.01 (allow anatomical detail)
+- Compactness: 0.3 → 0.005 (allow elongated atoms - necks, legs)
+- Attention sparsity: 4.0 → 0.5 (allow 6-8 atoms to collaborate)
+- Gaussian annealing: Keep σ ≥ 1.0 until epoch 40 (persistent scaffolding)
+
+V2.2 Key Features
+=================
+1. **Anisotropic Scaling**: sx, sy parameters allow atoms to stretch independently
+   - 56×56 square atoms can become 20×120 rectangles for long necks
+
+2. **Persistent Gaussian Scaffolding**:
+   - Refinement (21-40): σ from 2.0 → 1.0 (slower, was →0.5)
+   - Finalize (41-50): σ from 1.0 → 0 (was from 0.5)
+   - Keeps "hills" large enough for atoms to find distant structures
+
+3. **Minimal Smoothness Constraints**:
+   - Let atoms fragment/stretch if needed to match reconstruction
+   - Multiple atoms (6-8) collaborate to build complex shapes
+
+4. **Structure over Smoothness**:
+   - Atoms should look like "smudges" or "lines", not blobs
+   - Composed map forms rough skeletal structure, not smooth reconstruction
+
+Expected Results
+================
+- Atom shapes: Elongated smudges/lines (not round blobs)
+- Atom usage: 6-8 atoms active (not just 3-4)
+- Composed map: Skeletal bird structure with overlapping parts
 
 Usage:
     python geo_roto_v2.py --data_dir ./data/ig_maps \\
@@ -900,47 +911,50 @@ class RotoLDDMMTrainer:
         # Manual LR scheduling (no auto scheduler)
         self.base_lr = lr
 
-        # V2.1 Loss optimized for "organic" dot-patterns (group dots into anatomical parts)
+        # V2.2 Loss: STRUCTURE OVER SMOOTHNESS
+        # Philosophy: Let reconstruction signal dominate, allow atoms to stretch/fragment if needed
         self.criterion = RotoLDDMMLoss(
-            lambda_reconstruction=1.0,         # Standard reconstruction signal
+            lambda_reconstruction=15.0,        # CRITICAL: 15× increase - force model to match dots!
             lambda_atom_sparsity=3.0,          # Moderate: allow atoms to capture regions
             lambda_atom_diversity=2.0,         # Moderate: force different atoms
             lambda_pose_reg=0.01,              # Low: flexible poses
-            lambda_attention_sparsity=4.0,     # High: force fewer, better atoms per sample
+            lambda_attention_sparsity=0.5,     # REDUCED: allow 6-8 atoms to collaborate (was 4.0)
             lambda_local_smooth=0.8,           # Keep warps smooth but allow organic curves
             lambda_mass_conservation=1.0,      # Standard
-            lambda_atom_tv=0.5,                # RE-ENABLED: group dots into connected parts
-            lambda_atom_compactness=0.3,       # RE-INTRODUCED: force dots to form a "part"
+            lambda_atom_tv=0.01,               # MINIMAL: allow anatomical detail (was 0.5)
+            lambda_atom_compactness=0.005,     # MINIMAL: allow elongated atoms (was 0.3)
             lambda_atom_usage_balance=2.0,     # Prevent mode collapse
-            lambda_atom_overlap=1.0            # NEW: prevent atoms from stacking on same region
+            lambda_atom_overlap=0.1            # REDUCED: neck can be near head (was 1.0)
         ).to(device)
 
         self.history = defaultdict(list)
 
         print(f"\n{'='*80}")
-        print(f"Roto-LDDMM V2.1 Trainer: Organic Dot-Patterns (Anatomical Parts)")
+        print(f"Roto-LDDMM V2.2 Trainer: STRUCTURE OVER SMOOTHNESS")
         print(f"{'='*80}")
-        print(f"\n4-Stage Training Schedule:")
+        print(f"\n4-Stage Training Schedule (UPDATED ANNEALING):")
         print(f"  Stage 1 - Warmup     (Epochs 1-5):   σ=2.5, Atoms Frozen")
         print(f"  Stage 2 - Discovery  (Epochs 6-20):  σ=2.0, High LR")
-        print(f"  Stage 3 - Refinement (Epochs 21-40): σ→0.5, Moderate LR")
-        print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ=0, Low LR")
-        print(f"\nLoss Weights (V2.1 - Group Dots into Anatomical Parts):")
-        print(f"  - Reconstruction: 1.0 (standard signal)")
+        print(f"  Stage 3 - Refinement (Epochs 21-40): σ→1.0 (slower drop, was →0.5)")
+        print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ→0 (from 1.0, was from 0.5)")
+        print(f"\nLoss Weights (V2.2 - RECONSTRUCTION DOMINATES):")
+        print(f"  - Reconstruction: 15.0 ★★★ CRITICAL - 15× increase to force dot matching!")
+        print(f"  - Atom TV: 0.01 (MINIMAL - allow anatomical detail, was 0.5)")
+        print(f"  - Atom Compactness: 0.005 (MINIMAL - allow elongated atoms, was 0.3)")
+        print(f"  - Attention Sparsity: 0.5 (allow 6-8 atoms to collaborate, was 4.0)")
+        print(f"  - Overlap Penalty: 0.1 (minimal - neck can be near head, was 1.0)")
         print(f"  - Atom Sparsity: 3.0 (moderate)")
         print(f"  - Atom Diversity: 2.0 (force different atoms)")
-        print(f"  - Attention Sparsity: 4.0 (force fewer, better atoms)")
         print(f"  - Local Smooth: 0.8 (allow organic curves)")
-        print(f"  - Atom TV: 0.5 (RE-ENABLED - group dots)")
-        print(f"  - Atom Compactness: 0.3 (RE-INTRODUCED - form parts not fragments)")
         print(f"  - Usage Balance: 2.0 (prevent collapse)")
-        print(f"  - Overlap Penalty: 1.0 (NEW - prevent atoms stacking)")
-        print(f"\nKey Features (V2.1):")
-        print(f"  - Anisotropic scaling (sx, sy) for elongated structures (necks, legs)")
-        print(f"  - Spatial dilation on atom initialization (7x7 max pool)")
-        print(f"  - Balanced local warp scale (0.2) - allows curves without smearing")
-        print(f"  - Overlap penalty - forces atoms to spread across different body parts")
-        print(f"  - Soft compactness - groups scattered dots into cohesive anatomical parts")
+        print(f"\nPhilosophy Change (V2.1 → V2.2):")
+        print(f"  V2.1: Group dots into smooth, compact parts → Result: Blobs, not birds")
+        print(f"  V2.2: Let reconstruction dominate, atoms stretch to match → Goal: Skeletal structure")
+        print(f"\nKey Features:")
+        print(f"  - Anisotropic scaling (sx, sy) for elongated structures")
+        print(f"  - Persistent Gaussian scaffolding (σ ≥ 1.0 until epoch 40)")
+        print(f"  - Minimal smoothness constraints - let atoms stretch/fragment if needed")
+        print(f"  - Multiple atoms collaborate (6-8 instead of 3-4) to build complex shapes")
         print(f"{'='*80}\n")
 
     def get_stage_config(self, epoch):
@@ -965,10 +979,11 @@ class RotoLDDMMTrainer:
                 'lr_multiplier': 1.0  # High LR
             }
         elif self.stage_boundaries['refinement'][0] <= epoch <= self.stage_boundaries['refinement'][1]:
-            # Linear annealing: σ from 2.0 to 0.5
+            # UPDATED: Slower annealing - σ from 2.0 to 1.0 (was 2.0 → 0.5)
+            # Keeps "scaffolding" large enough for atoms to stretch into necks/legs
             start_epoch, end_epoch = self.stage_boundaries['refinement']
             progress = (epoch - start_epoch) / (end_epoch - start_epoch)
-            sigma = 2.0 - progress * 1.5  # 2.0 → 0.5
+            sigma = 2.0 - progress * 1.0  # 2.0 → 1.0 (slower drop)
             return {
                 'stage_name': 'Refinement',
                 'sigma': sigma,
@@ -976,10 +991,10 @@ class RotoLDDMMTrainer:
                 'lr_multiplier': 0.5  # Moderate LR
             }
         else:  # Finalize
-            # Linear decay from 0.5 to 0
+            # UPDATED: Final drop from 1.0 to 0 (was 0.5 → 0)
             start_epoch, end_epoch = self.stage_boundaries['finalize']
             progress = (epoch - start_epoch) / (end_epoch - start_epoch)
-            sigma = 0.5 * (1 - progress)  # 0.5 → 0
+            sigma = 1.0 * (1 - progress)  # 1.0 → 0
             return {
                 'stage_name': 'Finalize',
                 'sigma': sigma,
@@ -1063,10 +1078,9 @@ class RotoLDDMMTrainer:
 
             pbar.set_postfix({
                 'loss': losses['total'].item(),
-                'recon': losses['reconstruction'].item(),
+                'recon★': losses['reconstruction'].item(),  # Primary signal
                 'tv': losses['atom_tv'].item(),
-                'compact': losses['atom_compactness'].item(),
-                'overlap': losses['atom_overlap'].item()
+                'cmpct': losses['atom_compactness'].item()
             })
 
             if batch_idx % 50 == 0:
@@ -1097,13 +1111,13 @@ class RotoLDDMMTrainer:
             # Get stage info for display
             config = self.get_stage_config(epoch)
 
-            print(f"\nEpoch {epoch}/{num_epochs} Summary [{config['stage_name']}]:")
+            print(f"\nEpoch {epoch}/{num_epochs} Summary [{config['stage_name']}], σ={config['sigma']:.2f}:")
             print(f"  Total Loss: {avg_losses['total']:.4f}")
-            print(f"  Reconstruction: {avg_losses['reconstruction']:.4f}")
-            print(f"  Atom TV: {avg_losses['atom_tv']:.4f} (grouping force - lower=fragmented)")
-            print(f"  Atom Compactness: {avg_losses['atom_compactness']:.4f} (part formation - lower=scattered)")
-            print(f"  Atom Overlap: {avg_losses['atom_overlap']:.4f} (spatial separation - lower=spread out)")
-            print(f"  Attention Sparsity: {avg_losses['attention_sparsity']:.4f} (fewer atoms per sample)")
+            print(f"  ★ Reconstruction: {avg_losses['reconstruction']:.4f} ← PRIMARY SIGNAL (×15.0)")
+            print(f"  Atom TV: {avg_losses['atom_tv']:.6f} (minimal, ×0.01 - allow detail)")
+            print(f"  Atom Compactness: {avg_losses['atom_compactness']:.6f} (minimal, ×0.005 - allow stretch)")
+            print(f"  Atom Overlap: {avg_losses['atom_overlap']:.4f} (minimal, ×0.1 - allow proximity)")
+            print(f"  Attention Sparsity: {avg_losses['attention_sparsity']:.4f} (×0.5 - encourage collaboration)")
             print(f"  Usage Balance: {avg_losses['usage_balance']:.6f} (uniform atom usage)")
             print(f"  Atom Diversity: {avg_losses['atom_diversity']:.4f} (different atoms)")
             print(f"  Mass Conservation: {avg_losses['mass_conservation']:.4f}")
@@ -1150,19 +1164,31 @@ class RotoLDDMMTrainer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Roto-LDDMM V2: Gaussian Annealing for Dot-Point IG Maps',
+        description='Roto-LDDMM V2.2: STRUCTURE OVER SMOOTHNESS',
         epilog="""
-V2 INNOVATIONS: Optimized for Integrated Gradients (IG) Maps
-  - Gaussian Annealing: Blur σ=2.5→0 over 50 epochs for gradient flow
-  - 4-Stage Training: Warmup → Discovery → Refinement → Finalize
-  - Loss Rebalancing: TV/Compactness near zero (allow sharp, scattered dots)
-  - Max Composition: Preserve peak intensities (not softmax averaging)
+V2.2 PHILOSOPHY: Let reconstruction signal dominate to create skeletal structures
 
-TRAINING SCHEDULE:
+KEY CHANGES (V2.1 → V2.2):
+  - Reconstruction weight: 1.0 → 15.0 (15× increase!)
+  - TV loss: 0.5 → 0.01 (allow anatomical detail)
+  - Compactness: 0.3 → 0.005 (allow elongated atoms - necks, legs)
+  - Attention sparsity: 4.0 → 0.5 (allow 6-8 atoms to collaborate)
+  - Gaussian annealing: Keep σ ≥ 1.0 until epoch 40 (persistent scaffolding)
+
+ANISOTROPIC SCALING:
+  - Atoms can stretch independently: sx, sy ∈ [0.2, 2.0]
+  - 56×56 squares become 20×120 rectangles for necks/legs
+
+TRAINING SCHEDULE (UPDATED):
   Epochs 1-5:   Warmup (atoms frozen, σ=2.5)
   Epochs 6-20:  Discovery (atoms active, σ=2.0, high LR)
-  Epochs 21-40: Refinement (σ→0.5, moderate LR)
-  Epochs 41-50: Finalize (σ→0, low LR, exact dots)
+  Epochs 21-40: Refinement (σ→1.0, slower annealing, was →0.5)
+  Epochs 41-50: Finalize (σ→0, from 1.0, was from 0.5)
+
+EXPECTED RESULTS:
+  - Atoms: Elongated smudges/lines (not blobs)
+  - Usage: 6-8 atoms active (not just 3-4)
+  - Output: Skeletal bird structure with overlapping parts
 
 USAGE:
   python geo_roto_v2.py --data_dir ./data/ig_maps \\
@@ -1201,9 +1227,10 @@ USAGE:
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*80}")
-    print(f"Roto-LDDMM V2: Gaussian Annealing for Dot-Point IG Maps")
+    print(f"Roto-LDDMM V2.2: STRUCTURE OVER SMOOTHNESS")
     print(f"{'='*80}")
     print(f"Device: {device}")
+    print(f"\n★ Key Philosophy: Reconstruction signal (×15.0) DOMINATES smoothness priors")
 
     # Memory estimate for atom bank
     atom_memory_gb = (args.num_classes * args.k_atoms * 1 * args.atom_res * args.atom_res * 4) / (1024**3)
@@ -1217,13 +1244,14 @@ USAGE:
         print(f"  Memory: ~{atom_memory_gb:.3f} GB")
         print(f"  (Use --shared_atoms to reduce to ~{shared_memory_gb:.3f} GB)")
 
-    print(f"\nV2 Training Strategy:")
-    print(f"  4-Stage Gaussian Annealing:")
+    print(f"\nV2.2 Training Strategy:")
+    print(f"  4-Stage Gaussian Annealing (UPDATED):")
     print(f"    Stage 1 (Epochs 1-5):    Warmup - atoms frozen, σ=2.5")
     print(f"    Stage 2 (Epochs 6-20):   Discovery - σ=2.0, high LR")
-    print(f"    Stage 3 (Epochs 21-40):  Refinement - σ→0.5, moderate LR")
-    print(f"    Stage 4 (Epochs 41-{args.epochs}): Finalize - σ→0, low LR")
-    print(f"  Loss optimization: Low TV/Compactness for dot preservation")
+    print(f"    Stage 3 (Epochs 21-40):  Refinement - σ→1.0 (slower, was →0.5)")
+    print(f"    Stage 4 (Epochs 41-{args.epochs}): Finalize - σ→0 (from 1.0, was from 0.5)")
+    print(f"  Loss optimization: Reconstruction (×15.0) DOMINATES, minimal smoothness")
+    print(f"  Expected: Elongated atoms, 6-8 atoms active, skeletal structure")
 
     # Load dataset
     print(f"\nLoading saliency maps from {args.data_dir}...")
