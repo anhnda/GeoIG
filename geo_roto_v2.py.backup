@@ -742,6 +742,141 @@ class RotoLDDMMLoss(nn.Module):
 # ==========================================
 
 class RotoLDDMMTrainer:
+        self.data_dir = Path(data_dir)
+        self.saliency_dir = self.data_dir / "saliency_maps"
+        self.load_images = load_images
+
+        metadata_path = self.data_dir / "metadata.pkl"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Metadata not found: {metadata_path}")
+
+        self.metadata = joblib.load(metadata_path)
+
+        batch_files = sorted(self.saliency_dir.glob("batch_*.pkl"))
+        print(f"Loading {len(batch_files)} batch files into RAM...")
+
+        self.saliency_maps = torch.empty((max_samples, 1, 224, 224), dtype=torch.float16)
+        self.labels = torch.empty(max_samples, dtype=torch.long)
+
+        if load_images:
+            self.rgb_images = torch.empty((max_samples, 3, 224, 224), dtype=torch.uint8)
+        else:
+            self.rgb_images = None
+
+        class_counts = defaultdict(int)
+        corrupted_samples = 0
+        idx = 0
+
+        for batch_file in tqdm(batch_files, desc="Loading data"):
+            if idx >= max_samples:
+                break
+
+            batch_data = joblib.load(batch_file)
+
+            for item in batch_data:
+                if idx >= max_samples:
+                    break
+
+                label = item.get('true_label')
+                if label is None:
+                    corrupted_samples += 1
+                    continue
+
+                if max_samples_per_class is not None and class_counts[label] >= max_samples_per_class:
+                    continue
+
+                if 'saliency_map' not in item:
+                    corrupted_samples += 1
+                    continue
+
+                saliency_np = item['saliency_map']
+                saliency_shape = saliency_np.shape
+
+                if len(saliency_shape) < 2 or saliency_shape[-2:] != (224, 224) or 0 in saliency_shape:
+                    corrupted_samples += 1
+                    continue
+
+                if len(saliency_np.shape) == 2:
+                    saliency_np = saliency_np[np.newaxis, ...]
+                elif len(saliency_np.shape) == 3:
+                    if saliency_np.shape[0] not in [1, 3]:
+                        if saliency_np.shape[2] in [1, 3]:
+                            saliency_np = saliency_np.transpose(2, 0, 1)
+                        else:
+                            corrupted_samples += 1
+                            continue
+                    if saliency_np.shape[0] > 1:
+                        saliency_np = saliency_np.mean(axis=0, keepdims=True)
+
+                if saliency_np.shape != (1, 224, 224):
+                    corrupted_samples += 1
+                    continue
+
+                self.saliency_maps[idx] = torch.from_numpy(saliency_np).to(torch.float16)
+                self.labels[idx] = label
+
+                if load_images:
+                    if 'rgb_image' not in item:
+                        corrupted_samples += 1
+                        continue
+
+                    try:
+                        rgb_np = item['rgb_image']
+                        if len(rgb_np.shape) == 3:
+                            if rgb_np.shape[0] == 3:
+                                pass
+                            elif rgb_np.shape[2] == 3:
+                                rgb_np = rgb_np.transpose(2, 0, 1)
+                            else:
+                                corrupted_samples += 1
+                                continue
+                        else:
+                            corrupted_samples += 1
+                            continue
+
+                        if rgb_np.dtype != np.uint8:
+                            if rgb_np.max() <= 1.0:
+                                rgb_np = (rgb_np * 255).astype(np.uint8)
+                            else:
+                                rgb_np = rgb_np.astype(np.uint8)
+
+                        self.rgb_images[idx] = torch.from_numpy(rgb_np)
+                    except Exception:
+                        corrupted_samples += 1
+                        continue
+
+                class_counts[label] += 1
+                idx += 1
+
+            del batch_data
+            gc.collect()
+
+        self.saliency_maps = self.saliency_maps[:idx]
+        self.labels = self.labels[:idx]
+        if load_images:
+            self.rgb_images = self.rgb_images[:idx]
+
+        print(f"Loaded {len(self.saliency_maps)} samples ({corrupted_samples} corrupted)")
+
+    def __len__(self):
+        return len(self.saliency_maps)
+
+    def __getitem__(self, idx):
+        saliency = self.saliency_maps[idx].float()
+        label = self.labels[idx].item()
+
+        if self.load_images:
+            image = self.rgb_images[idx].float() / 255.0
+            return saliency, label, image
+        else:
+            return saliency, label, None
+
+
+# ==========================================
+# Trainer
+# ==========================================
+
+class RotoLDDMMTrainer:
     """
     Trainer for Roto-LDDMM V2 with 4-stage Gaussian annealing.
 
@@ -1013,6 +1148,56 @@ class RotoLDDMMTrainer:
         }, checkpoint_path)
 
         print(f"  Checkpoint saved: {checkpoint_path}")
+
+
+# ==========================================
+# Seed Map Sampling
+# ==========================================
+
+def sample_seed_maps(dataset, num_classes=1000, samples_per_class=1):
+    """
+    Sample representative saliency maps for atom initialization.
+
+    Args:
+        dataset: SaliencyMapDataset - The loaded dataset
+        num_classes: int - Number of classes
+        samples_per_class: int - How many samples to average per class
+
+    Returns:
+        seed_maps: dict - {class_id: (1, H, W) tensor} averaged saliency map per class
+    """
+    print(f"\n{'='*80}")
+    print(f"Sampling Seed Maps for Smart Atom Initialization")
+    print(f"{'='*80}")
+
+    class_samples = defaultdict(list)
+
+    # Collect samples
+    print(f"Collecting {samples_per_class} sample(s) per class...")
+    for idx in tqdm(range(len(dataset)), desc="Scanning dataset"):
+        saliency, label, _ = dataset[idx]
+
+        if len(class_samples[label]) < samples_per_class:
+            class_samples[label].append(saliency)
+
+        # Stop early if we have enough samples for all classes
+        if len(class_samples) >= num_classes:
+            if all(len(samples) >= samples_per_class for samples in class_samples.values()):
+                break
+
+    # Average samples per class
+    seed_maps = {}
+    for class_id, samples in class_samples.items():
+        if samples:
+            # Stack and average
+            stacked = torch.stack(samples, dim=0)  # (N, 1, H, W)
+            avg_map = stacked.mean(dim=0)  # (1, H, W)
+            seed_maps[class_id] = avg_map
+
+    print(f"Collected seeds for {len(seed_maps)} classes")
+    print(f"{'='*80}\n")
+
+    return seed_maps
 
 
 # ==========================================
