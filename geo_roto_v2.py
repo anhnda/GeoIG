@@ -521,7 +521,8 @@ class RotoLDDMMLoss(nn.Module):
                  lambda_local_smooth=0.5,           # INCREASED: smooth warps (was 0.05)
                  lambda_mass_conservation=1.0,      # Standard
                  lambda_atom_tv=0.1,                # NEAR ZERO: allow sharp dots (was 2.0)
-                 lambda_atom_compactness=0.05):     # NEAR ZERO: allow scattered dots (was 1.0)
+                 lambda_atom_compactness=0.05,      # NEAR ZERO: allow scattered dots (was 1.0)
+                 lambda_atom_usage_balance=2.0):    # NEW: prevent mode collapse
         super().__init__()
         self.lambda_reconstruction = lambda_reconstruction
         self.lambda_atom_sparsity = lambda_atom_sparsity
@@ -532,6 +533,7 @@ class RotoLDDMMLoss(nn.Module):
         self.lambda_mass_conservation = lambda_mass_conservation
         self.lambda_atom_tv = lambda_atom_tv
         self.lambda_atom_compactness = lambda_atom_compactness
+        self.lambda_atom_usage_balance = lambda_atom_usage_balance
 
     def reconstruction_loss(self, h_original, h_composed):
         """MSE between input and composed pattern."""
@@ -686,6 +688,30 @@ class RotoLDDMMLoss(nn.Module):
         relative_change = torch.abs(mass_composed - mass_original) / (mass_original + 1e-8)
         return relative_change.mean()
 
+    def atom_usage_balance_loss(self, attention):
+        """
+        Encourage balanced usage of all atoms across the batch.
+
+        Prevents mode collapse where only 1-2 atoms are used and others ignored.
+        Computes the variance of mean attention across atoms - low variance means
+        all atoms are used equally.
+
+        Args:
+            attention: (B, K) - Attention weights across batch
+
+        Returns:
+            loss: Scalar - Variance of atom usage (minimize for balance)
+        """
+        # Mean attention per atom across the batch
+        mean_attention_per_atom = attention.mean(dim=0)  # (K,)
+
+        # Compute variance - we want this to be small (uniform usage)
+        # If all atoms used equally, each should have ~1/K attention
+        target_uniform = 1.0 / attention.shape[1]
+        variance = ((mean_attention_per_atom - target_uniform) ** 2).mean()
+
+        return variance
+
     def forward(self, h_original, h_composed, atoms, poses, attention, v_local=None):
         """
         Compute total loss with improved structural priors.
@@ -710,6 +736,7 @@ class RotoLDDMMLoss(nn.Module):
         loss_mass_cons = self.mass_conservation_loss(h_original, h_composed)
         loss_atom_tv = self.atom_total_variation_loss(atoms)
         loss_atom_compact = self.atom_compactness_loss(atoms)
+        loss_usage_balance = self.atom_usage_balance_loss(attention)
 
         total_loss = (
             self.lambda_reconstruction * loss_recon +
@@ -720,7 +747,8 @@ class RotoLDDMMLoss(nn.Module):
             self.lambda_local_smooth * loss_local_smooth +
             self.lambda_mass_conservation * loss_mass_cons +
             self.lambda_atom_tv * loss_atom_tv +
-            self.lambda_atom_compactness * loss_atom_compact
+            self.lambda_atom_compactness * loss_atom_compact +
+            self.lambda_atom_usage_balance * loss_usage_balance
         )
 
         return {
@@ -733,7 +761,8 @@ class RotoLDDMMLoss(nn.Module):
             'local_smoothness': loss_local_smooth,
             'mass_conservation': loss_mass_cons,
             'atom_tv': loss_atom_tv,
-            'atom_compactness': loss_atom_compact
+            'atom_compactness': loss_atom_compact,
+            'usage_balance': loss_usage_balance
         }
 
 
@@ -787,14 +816,15 @@ class RotoLDDMMTrainer:
         # V2 Loss optimized for dots
         self.criterion = RotoLDDMMLoss(
             lambda_reconstruction=1.0,
-            lambda_atom_sparsity=5.0,          # High: clean atoms
-            lambda_atom_diversity=2.0,         # Moderate: different atoms
+            lambda_atom_sparsity=3.0,          # REDUCED: allow more atom detail (was 5.0)
+            lambda_atom_diversity=5.0,         # INCREASED: force different atoms (was 2.0)
             lambda_pose_reg=0.01,              # Low: flexible poses
-            lambda_attention_sparsity=3.0,     # HIGH: sparse attention
+            lambda_attention_sparsity=0.5,     # REDUCED: allow multiple atoms (was 3.0)
             lambda_local_smooth=0.5,           # INCREASED: smooth warps
             lambda_mass_conservation=1.0,      # Standard
-            lambda_atom_tv=0.1,                # NEAR ZERO: sharp dots
-            lambda_atom_compactness=0.05       # NEAR ZERO: scattered ok
+            lambda_atom_tv=0.5,                # INCREASED: encourage connected parts (was 0.1)
+            lambda_atom_compactness=0.5,       # INCREASED: encourage part-like shapes (was 0.05)
+            lambda_atom_usage_balance=2.0      # NEW: prevent mode collapse
         ).to(device)
 
         self.history = defaultdict(list)
@@ -807,14 +837,15 @@ class RotoLDDMMTrainer:
         print(f"  Stage 2 - Discovery  (Epochs 6-20):  σ=2.0, High LR")
         print(f"  Stage 3 - Refinement (Epochs 21-40): σ→0.5, Moderate LR")
         print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ=0, Low LR")
-        print(f"\nLoss Weights (V2 - Optimized for Dots):")
+        print(f"\nLoss Weights (V2 - Anti-Collapse Configuration):")
         print(f"  - Reconstruction: 1.0")
-        print(f"  - Atom Sparsity: 5.0")
-        print(f"  - Atom Diversity: 2.0")
-        print(f"  - Attention Sparsity: 3.0 (HIGH - sparse usage)")
-        print(f"  - Local Smooth: 0.5 (INCREASED)")
-        print(f"  - Atom TV: 0.1 (NEAR ZERO - allow sharp dots)")
-        print(f"  - Atom Compactness: 0.05 (NEAR ZERO - allow scatter)")
+        print(f"  - Atom Sparsity: 3.0 (REDUCED - allow detail)")
+        print(f"  - Atom Diversity: 5.0 (INCREASED - prevent collapse)")
+        print(f"  - Attention Sparsity: 0.5 (REDUCED - allow multi-atom)")
+        print(f"  - Local Smooth: 0.5")
+        print(f"  - Atom TV: 0.5 (INCREASED - connected parts)")
+        print(f"  - Atom Compactness: 0.5 (INCREASED - part-like shapes)")
+        print(f"  - Usage Balance: 2.0 (NEW - force all atoms to be used)")
         print(f"{'='*80}\n")
 
     def get_stage_config(self, epoch):
@@ -973,6 +1004,7 @@ class RotoLDDMMTrainer:
             print(f"  Total Loss: {avg_losses['total']:.4f}")
             print(f"  Reconstruction: {avg_losses['reconstruction']:.4f}")
             print(f"  Attention Sparsity (Entropy): {avg_losses['attention_sparsity']:.4f}")
+            print(f"  Usage Balance: {avg_losses['usage_balance']:.6f} (low=uniform usage)")
             print(f"  Atom Sparsity: {avg_losses['atom_sparsity']:.4f}")
             print(f"  Atom Diversity: {avg_losses['atom_diversity']:.4f}")
             print(f"  Atom TV: {avg_losses['atom_tv']:.6f} (low=sharp dots)")
