@@ -98,14 +98,16 @@ class SE2Transform(nn.Module):
 
     def forward(self, atoms, poses):
         """
-        Transform atoms according to SE(2) poses.
+        Transform atoms according to SE(2) poses with anisotropic scaling.
 
         Args:
             atoms: (B, K, 1, H_atom, W_atom) - Atom templates
-            poses: (B, K, 4) - [tx, ty, θ, scale] for each atom
+            poses: (B, K, 4) or (B, K, 5) - Pose parameters for each atom
+                   If 4: [tx, ty, θ, scale] (isotropic scaling - for backward compatibility)
+                   If 5: [tx, ty, θ, sx, sy] (anisotropic scaling)
                    tx, ty ∈ [-1, 1] (normalized coordinates)
                    θ ∈ [0, 2π] (rotation angle)
-                   scale ∈ (0, 2] (scaling factor)
+                   sx, sy ∈ (0, 2] (scaling factors in x and y directions)
 
         Returns:
             transformed_atoms: (B, K, 1, H, W) - Atoms placed in image plane
@@ -117,22 +119,32 @@ class SE2Transform(nn.Module):
         tx = poses[:, :, 0]  # (B, K)
         ty = poses[:, :, 1]  # (B, K)
         theta = poses[:, :, 2]  # (B, K)
-        scale = poses[:, :, 3]  # (B, K)
+
+        # Handle both isotropic (4 params) and anisotropic (5 params) scaling
+        if poses.shape[2] == 4:
+            # Backward compatibility: isotropic scaling
+            sx = sy = poses[:, :, 3]  # (B, K)
+        else:
+            # Anisotropic scaling
+            sx = poses[:, :, 3]  # (B, K)
+            sy = poses[:, :, 4]  # (B, K)
 
         # Create affine transformation matrices for each (batch, atom) pair
         # Affine matrix format for grid_sample: [2, 3] for each transform
         cos_theta = torch.cos(theta)  # (B, K)
         sin_theta = torch.sin(theta)  # (B, K)
 
-        # Build affine matrices: [scale*cos(θ), -scale*sin(θ), tx]
-        #                        [scale*sin(θ),  scale*cos(θ), ty]
+        # Build affine matrices with anisotropic scaling:
+        # First scale (sx in x, sy in y), then rotate, then translate
+        # M = T * R * S = [sx*cos(θ), -sy*sin(θ), tx]
+        #                 [sx*sin(θ),  sy*cos(θ), ty]
         # Shape: (B, K, 2, 3)
         affine_matrices = torch.zeros(B, K, 2, 3, device=atoms.device)
-        affine_matrices[:, :, 0, 0] = scale * cos_theta
-        affine_matrices[:, :, 0, 1] = -scale * sin_theta
+        affine_matrices[:, :, 0, 0] = sx * cos_theta
+        affine_matrices[:, :, 0, 1] = -sy * sin_theta
         affine_matrices[:, :, 0, 2] = tx
-        affine_matrices[:, :, 1, 0] = scale * sin_theta
-        affine_matrices[:, :, 1, 1] = scale * cos_theta
+        affine_matrices[:, :, 1, 0] = sx * sin_theta
+        affine_matrices[:, :, 1, 1] = sy * cos_theta
         affine_matrices[:, :, 1, 2] = ty
 
         # Flatten batch and atoms for grid_sample

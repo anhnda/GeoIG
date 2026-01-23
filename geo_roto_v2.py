@@ -70,7 +70,10 @@ class PoseAttentionPredictor(nn.Module):
     Predict SE(2) poses and attention weights for each atom.
 
     For each input image, this network outputs:
-    1. Pose parameters (tx, ty, θ, scale) for each of K atoms
+    1. Pose parameters (tx, ty, θ, sx, sy) for each of K atoms
+       - tx, ty: translation
+       - θ: rotation
+       - sx, sy: anisotropic scaling (allows elongated structures like necks/legs)
     2. Attention weights w_k indicating atom importance
     3. Local velocity field for refinement (optional)
     """
@@ -101,12 +104,13 @@ class PoseAttentionPredictor(nn.Module):
 
         feature_dim = 256 * 7 * 7
 
-        # Head 1: Pose parameters (tx, ty, θ, scale) for K atoms
+        # Head 1: Pose parameters (tx, ty, θ, sx, sy) for K atoms
+        # CHANGED: Now 5 params per atom to support anisotropic scaling
         self.pose_head = nn.Sequential(
             nn.Linear(feature_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(512, self.K * 4)  # 4 params per atom
+            nn.Linear(512, self.K * 5)  # 5 params per atom: tx, ty, θ, sx, sy
         )
 
         # Head 2: Attention weights
@@ -128,13 +132,16 @@ class PoseAttentionPredictor(nn.Module):
                 nn.Linear(1024, self.K * self.local_v_dim),
                 nn.Tanh()
             )
-            self.local_v_scale = 0.3  # Small deformations
+            # CRITICAL FIX: Reduced from 0.3 to 0.05 to prevent "smearing"
+            # The local warp should only handle minor deformations, not major transformations
+            self.local_v_scale = 0.05  # Very small deformations (was 0.3)
 
         # Initialize pose head to identity transformations
         nn.init.normal_(self.pose_head[-1].weight, mean=0.0, std=0.01)
         nn.init.constant_(self.pose_head[-1].bias, 0.0)
-        # Set scale bias to 0.5 (after sigmoid -> ~0.62)
-        self.pose_head[-1].bias.data[3::4] = 0.0
+        # Set scale biases for sx and sy to 0.0 (after sigmoid -> ~0.5)
+        self.pose_head[-1].bias.data[3::5] = 0.0  # sx (every 5th param starting at index 3)
+        self.pose_head[-1].bias.data[4::5] = 0.0  # sy (every 5th param starting at index 4)
 
         # Initialize attention to uniform
         nn.init.normal_(self.attention_head[-1].weight, mean=0.0, std=0.01)
@@ -146,7 +153,7 @@ class PoseAttentionPredictor(nn.Module):
             h_i: (B, 1, H, W) - Input saliency maps
 
         Returns:
-            poses: (B, K, 4) - SE(2) parameters [tx, ty, θ, scale]
+            poses: (B, K, 5) - SE(2) parameters [tx, ty, θ, sx, sy]
             attention: (B, K) - Attention weights (softmax normalized)
             v_local: (B, K, 2, v_H, v_W) - Local velocity fields (optional)
         """
@@ -156,16 +163,18 @@ class PoseAttentionPredictor(nn.Module):
         features = self.backbone(h_i)
 
         # Predict poses
-        poses_flat = self.pose_head(features)  # (B, K*4)
-        poses = poses_flat.view(B, self.K, 4)
+        poses_flat = self.pose_head(features)  # (B, K*5)
+        poses = poses_flat.view(B, self.K, 5)
 
         # Apply activations to constrain pose parameters
         # tx, ty: tanh (range [-1, 1])
         poses[:, :, 0:2] = torch.tanh(poses[:, :, 0:2])
         # θ: map to [0, 2π]
         poses[:, :, 2] = torch.sigmoid(poses[:, :, 2]) * 2 * np.pi
-        # scale: sigmoid mapped to [0.3, 1.5]
-        poses[:, :, 3] = 0.3 + 1.2 * torch.sigmoid(poses[:, :, 3])
+        # sx (scale x): sigmoid mapped to [0.2, 2.0] for anisotropic scaling
+        poses[:, :, 3] = 0.2 + 1.8 * torch.sigmoid(poses[:, :, 3])
+        # sy (scale y): sigmoid mapped to [0.2, 2.0] for anisotropic scaling
+        poses[:, :, 4] = 0.2 + 1.8 * torch.sigmoid(poses[:, :, 4])
 
         # Predict attention weights
         attention_logits = self.attention_head(features)  # (B, K)
@@ -259,6 +268,10 @@ class AtomBank(nn.Module):
         """
         Initialize atoms using greedy peak detection on seed maps.
 
+        IMPORTANT: Applies spatial dilation to give atoms a "body" that can
+        capture gradients during early training. Without this, tiny dot-atoms
+        won't see the gradient signal from blurred targets.
+
         Args:
             seed_maps: dict or Tensor - Seed saliency maps
             shared_atoms: bool - Whether to share atoms across classes
@@ -297,6 +310,21 @@ class AtomBank(nn.Module):
                     _, patches = get_part_seeds(seed_maps[class_id], k_atoms=self.K,
                                                patch_size=self.atom_res[0])
                     atoms_init[class_id] = patches
+
+        # CRITICAL FIX: Dilate patches to give atoms a "body"
+        # This transforms tiny dot-seeds into blob-seeds that can catch gradients
+        # Use 7x7 max pooling to expand active regions
+        print(f"  Applying spatial dilation (7x7 max pool) to atom seeds...")
+        if shared_atoms:
+            # atoms_init: (K, 1, H, W)
+            atoms_init = F.max_pool2d(atoms_init, kernel_size=7, stride=1, padding=3)
+        else:
+            # atoms_init: (num_classes, K, 1, H, W)
+            # Flatten to (num_classes*K, 1, H, W) for max_pool2d
+            orig_shape = atoms_init.shape
+            atoms_flat = atoms_init.view(-1, 1, *self.atom_res)
+            atoms_flat = F.max_pool2d(atoms_flat, kernel_size=7, stride=1, padding=3)
+            atoms_init = atoms_flat.view(orig_shape)
 
         # Add small noise to break symmetry
         atoms_init = atoms_init + torch.randn_like(atoms_init) * 0.01
@@ -572,15 +600,16 @@ class RotoLDDMMLoss(nn.Module):
         Penalize extreme poses.
 
         Args:
-            poses: (B, K, 4) - [tx, ty, θ, scale]
+            poses: (B, K, 5) - [tx, ty, θ, sx, sy]
         """
         # Penalize large translations
         translation_penalty = (poses[:, :, 0:2] ** 2).mean()
 
-        # Penalize extreme scales (prefer scale ≈ 1)
-        scale_penalty = ((poses[:, :, 3] - 1.0) ** 2).mean()
+        # Penalize extreme scales (prefer sx ≈ 1 and sy ≈ 1)
+        scale_x_penalty = ((poses[:, :, 3] - 1.0) ** 2).mean()
+        scale_y_penalty = ((poses[:, :, 4] - 1.0) ** 2).mean()
 
-        return translation_penalty + scale_penalty
+        return translation_penalty + scale_x_penalty + scale_y_penalty
 
     def attention_sparsity_loss(self, attention):
         """
@@ -821,17 +850,18 @@ class RotoLDDMMTrainer:
         self.base_lr = lr
 
         # V2 Loss optimized for dots (Anti-Collapse + Scatter-Tolerant)
+        # UPDATED: Further tuning to prevent spatial collapse and smearing
         self.criterion = RotoLDDMMLoss(
-            lambda_reconstruction=1.0,
+            lambda_reconstruction=5.0,         # CRITICAL: Increased from 1.0 to 5.0 (stronger signal)
             lambda_atom_sparsity=2.0,          # REDUCED: allow atoms to capture regions (was 3.0)
             lambda_atom_diversity=5.0,         # INCREASED: force different atoms (was 2.0)
             lambda_pose_reg=0.01,              # Low: flexible poses
             lambda_attention_sparsity=0.5,     # REDUCED: allow multiple atoms (was 3.0)
-            lambda_local_smooth=0.5,           # INCREASED: smooth warps
+            lambda_local_smooth=2.5,           # CRITICAL: Increased from 0.5 to 2.5 (prevent smearing)
             lambda_mass_conservation=1.0,      # Standard
             lambda_atom_tv=0.2,                # MODERATE: some smoothness (was 0.5)
-            lambda_atom_compactness=0.01,      # VERY LOW: allow scattered atoms (was 0.5!)
-            lambda_atom_usage_balance=3.0      # INCREASED: stronger anti-collapse (was 2.0)
+            lambda_atom_compactness=0.001,     # CRITICAL: Reduced from 0.01 to 0.001 (allow elongated atoms)
+            lambda_atom_usage_balance=5.0      # CRITICAL: Increased from 3.0 to 5.0 (force all atoms used)
         ).to(device)
 
         self.history = defaultdict(list)
@@ -844,15 +874,19 @@ class RotoLDDMMTrainer:
         print(f"  Stage 2 - Discovery  (Epochs 6-20):  σ=2.0, High LR")
         print(f"  Stage 3 - Refinement (Epochs 21-40): σ→0.5, Moderate LR")
         print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ=0, Low LR")
-        print(f"\nLoss Weights (V2 - Anti-Collapse + Scatter-Tolerant):")
-        print(f"  - Reconstruction: 1.0")
+        print(f"\nLoss Weights (V2.1 - Anti-Smear + Anisotropic Scaling):")
+        print(f"  - Reconstruction: 5.0 (INCREASED - stronger signal)")
         print(f"  - Atom Sparsity: 2.0 (allow atoms to capture regions)")
         print(f"  - Atom Diversity: 5.0 (STRONG - prevent collapse)")
         print(f"  - Attention Diversity: 0.5 (target ~4 atoms per sample)")
-        print(f"  - Local Smooth: 0.5")
+        print(f"  - Local Smooth: 2.5 (CRITICAL - prevent smearing, was 0.5)")
         print(f"  - Atom TV: 0.2 (moderate smoothness)")
-        print(f"  - Atom Compactness: 0.01 (VERY LOW - allow scattered atoms)")
-        print(f"  - Usage Balance: 3.0 (STRONG - force all atoms used)")
+        print(f"  - Atom Compactness: 0.001 (ULTRA LOW - allow elongated atoms like necks)")
+        print(f"  - Usage Balance: 5.0 (CRITICAL - force all atoms used, was 3.0)")
+        print(f"\nNew Features:")
+        print(f"  - Anisotropic scaling (sx, sy) for elongated structures (necks, legs)")
+        print(f"  - Spatial dilation on atom initialization (7x7 max pool)")
+        print(f"  - Reduced local warp scale (0.05, was 0.3) to prevent smearing")
         print(f"{'='*80}\n")
 
     def get_stage_config(self, epoch):

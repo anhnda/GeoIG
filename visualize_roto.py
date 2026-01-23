@@ -398,11 +398,21 @@ class RotoVisualizer:
         # Row 2: Pose parameters table
         ax_poses = fig.add_subplot(gs[1, 3:])
         ax_poses.axis('off')
-        pose_text = "Top-5 Atom Poses (tx, ty, θ, scale):\n\n"
+        # Handle both old (4 params) and new (5 params) pose formats
+        is_anisotropic = poses_np.shape[1] == 5
+        if is_anisotropic:
+            pose_text = "Top-5 Atom Poses (tx, ty, θ, sx, sy):\n\n"
+        else:
+            pose_text = "Top-5 Atom Poses (tx, ty, θ, scale):\n\n"
         for i, k in enumerate(top_k_indices):
-            tx, ty, theta, scale = poses_np[k]
-            theta_deg = theta * 180 / np.pi
-            pose_text += f"Atom {k}: tx={tx:.2f}, ty={ty:.2f}, θ={theta_deg:.0f}°, s={scale:.2f}\n"
+            if is_anisotropic:
+                tx, ty, theta, sx, sy = poses_np[k]
+                theta_deg = theta * 180 / np.pi
+                pose_text += f"Atom {k}: tx={tx:.2f}, ty={ty:.2f}, θ={theta_deg:.0f}°, sx={sx:.2f}, sy={sy:.2f}\n"
+            else:
+                tx, ty, theta, scale = poses_np[k]
+                theta_deg = theta * 180 / np.pi
+                pose_text += f"Atom {k}: tx={tx:.2f}, ty={ty:.2f}, θ={theta_deg:.0f}°, s={scale:.2f}\n"
             pose_text += f"         Attention: {attention_np[k]*100:.1f}%\n\n"
         ax_poses.text(0.1, 0.9, pose_text, fontsize=11, family='monospace',
                      verticalalignment='top', transform=ax_poses.transAxes)
@@ -426,12 +436,23 @@ class RotoVisualizer:
             im_atom = ax_atom.imshow(atom, cmap='hot', interpolation='bilinear', vmin=0, vmax=vmax)
             plt.colorbar(im_atom, ax=ax_atom, fraction=0.046)
 
-            tx, ty, theta, scale = poses_np[k]
-            theta_deg = theta * 180 / np.pi
-            ax_atom.set_title(f'Atom {k} (Attention: {attention_np[k]*100:.1f}%)\n'
-                            f'Pose: tx={tx:.2f}, ty={ty:.2f}, θ={theta_deg:.0f}°, s={scale:.2f}\n'
-                            f'max={atom.max():.3f}, vmax={vmax:.3f}',
-                            fontsize=10)
+            # Handle both old (4 params) and new (5 params) pose formats
+            if is_anisotropic:
+                tx, ty, theta, sx, sy = poses_np[k]
+                theta_deg = theta * 180 / np.pi
+                ax_atom.set_title(f'Atom {k} (Attention: {attention_np[k]*100:.1f}%)\n'
+                                f'Pose: tx={tx:.2f}, ty={ty:.2f}, θ={theta_deg:.0f}°, sx={sx:.2f}, sy={sy:.2f}\n'
+                                f'max={atom.max():.3f}, vmax={vmax:.3f}',
+                                fontsize=10)
+                scale_for_arrow = (sx + sy) / 2  # Average scale for arrow visualization
+            else:
+                tx, ty, theta, scale = poses_np[k]
+                theta_deg = theta * 180 / np.pi
+                ax_atom.set_title(f'Atom {k} (Attention: {attention_np[k]*100:.1f}%)\n'
+                                f'Pose: tx={tx:.2f}, ty={ty:.2f}, θ={theta_deg:.0f}°, s={scale:.2f}\n'
+                                f'max={atom.max():.3f}, vmax={vmax:.3f}',
+                                fontsize=10)
+                scale_for_arrow = scale
             ax_atom.axis('off')
 
             # Visualize pose as arrow on composed map
@@ -445,7 +466,7 @@ class RotoVisualizer:
                 ax_composed.add_patch(circle)
 
                 # Draw arrow showing rotation
-                arrow_len = 20 * scale
+                arrow_len = 20 * scale_for_arrow
                 dx = arrow_len * np.cos(theta)
                 dy = arrow_len * np.sin(theta)
                 arrow = FancyArrow(cx, cy, dx, dy, width=3, color='cyan', alpha=0.8)
