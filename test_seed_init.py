@@ -10,7 +10,6 @@ import numpy as np
 
 # Import from geo_roto_v2
 import sys
-sys.path.insert(0, '/Users/anhnd/CodingSpace/Python/GeoIG')
 from geo_roto_v2 import get_part_seeds
 
 
@@ -102,7 +101,7 @@ def visualize_seed_discovery(saliency_map, k_atoms=5):
         axes[1, idx+1].axis('off')
 
     plt.tight_layout()
-    plt.savefig('/Users/anhnd/CodingSpace/Python/GeoIG/seed_discovery_demo.png', dpi=150)
+    plt.savefig('seed_discovery_demo.png', dpi=150)
     print(f"\n✓ Visualization saved to: seed_discovery_demo.png")
     print(f"\nDiscovered {k_atoms} parts in order:")
     for idx, (y, x) in enumerate(seeds):
