@@ -95,6 +95,10 @@ class ImageNet1kSubsetDataset:
 
         # Only consider first N classes
         target_classes = list(range(self.num_classes))
+
+        # Create label remapping: original_label -> remapped_label (0 to N-1)
+        self.label_remap = {orig: new for new, orig in enumerate(target_classes)}
+
         class_samples = {cls_idx: [] for cls_idx in target_classes}
 
         train_parquet_files = sorted(self.raw_dir.glob("train-*.parquet"))
@@ -132,29 +136,38 @@ class ImageNet1kSubsetDataset:
         if self.num_classes > 10:
             print(f"  ...")
 
-        # Randomly select samples from collected data
+        # Randomly select samples from collected data AND remap labels
         self.samples = []
         for class_idx in target_classes:
             available = class_samples[class_idx]
+            remapped_label = self.label_remap[class_idx]  # Map to 0-(N-1)
+
             if len(available) >= self.samples_per_class:
                 # Random sampling
                 sampled = random.sample(available, self.samples_per_class)
-                self.samples.extend(sampled)
+                # Remap labels in samples
+                sampled_remapped = [(img_bytes, remapped_label) for img_bytes, _ in sampled]
+                self.samples.extend(sampled_remapped)
             else:
                 print(f"WARNING: Class {class_idx} has only {len(available)} samples")
-                self.samples.extend(available)
+                # Remap labels
+                available_remapped = [(img_bytes, remapped_label) for img_bytes, _ in available]
+                self.samples.extend(available_remapped)
 
         print(f"\nTotal sampled images: {len(self.samples)}")
 
         # Save metadata
         print(f"Saving subset dataset to {self.sampled_dir}...")
+        print(f"IMPORTANT: Labels remapped to 0-{self.num_classes-1} (use --num_classes {self.num_classes} in geo_roto_v2.py)")
         joblib.dump({
             'samples': self.samples,
             'num_classes': self.num_classes,
             'samples_per_class': self.samples_per_class,
             'wnid_to_idx': self.wnid_to_idx,
             'idx_to_wnid': self.idx_to_wnid,
-            'target_classes': target_classes
+            'target_classes': target_classes,
+            'label_remap': self.label_remap,  # Save remapping info
+            'note': f'Labels remapped: original classes {target_classes} -> new labels 0-{self.num_classes-1}'
         }, self.metadata_path)
         print(f"✓ Subset dataset cached!")
 
@@ -164,10 +177,12 @@ class ImageNet1kSubsetDataset:
         self.samples = metadata['samples']
         self.wnid_to_idx = metadata['wnid_to_idx']
         self.idx_to_wnid = metadata['idx_to_wnid']
+        self.label_remap = metadata.get('label_remap', {})  # Load remapping if available
 
         print(f"Loaded {len(self.samples)} images from cache")
         print(f"  Number of classes: {metadata['num_classes']}")
         print(f"  Samples per class: {metadata['samples_per_class']}")
+        print(f"  IMPORTANT: Use --num_classes {metadata['num_classes']} when training!")
 
     def __len__(self):
         return len(self.samples)
