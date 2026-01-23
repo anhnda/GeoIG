@@ -1130,7 +1130,7 @@ class RotoLDDMMTrainer:
             # Apply Gaussian blur (V2: annealing strategy)
             # Early training: blur creates "hills" for gradient flow
             # Later training: blur → 0 to learn exact dot patterns
-            saliency_maps_blurred = self.gaussian_blur(saliency_maps, sigma=sigma)
+            saliency_maps_blurred = saliency_maps #self.gaussian_blur(saliency_maps, sigma=sigma)
 
             # Forward pass (use blurred input)
             h_composed, poses, attention, atoms_transformed = self.model(
