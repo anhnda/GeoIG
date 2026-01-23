@@ -562,7 +562,8 @@ class RotoLDDMMLoss(nn.Module):
                  lambda_atom_tv=0.5,                # RE-ENABLED: group dots into connected parts
                  lambda_atom_compactness=0.3,       # RE-INTRODUCED: force dots to form a "part"
                  lambda_atom_usage_balance=2.0,     # Prevent mode collapse
-                 lambda_atom_overlap=1.0):          # NEW: prevent atoms from stacking
+                 lambda_atom_overlap=1.0,           # NEW: prevent atoms from stacking
+                 lambda_atom_peak_penalty=0.5):     # NEW: prevent overly peaked atoms
         super().__init__()
         self.lambda_reconstruction = lambda_reconstruction
         self.lambda_atom_sparsity = lambda_atom_sparsity
@@ -575,6 +576,7 @@ class RotoLDDMMLoss(nn.Module):
         self.lambda_atom_compactness = lambda_atom_compactness
         self.lambda_atom_usage_balance = lambda_atom_usage_balance
         self.lambda_atom_overlap = lambda_atom_overlap
+        self.lambda_atom_peak_penalty = lambda_atom_peak_penalty
 
     def reconstruction_loss(self, h_original, h_composed):
         """MSE between input and composed pattern."""
@@ -801,6 +803,41 @@ class RotoLDDMMLoss(nn.Module):
         # Average across all pairs
         return weighted_overlap.sum() / (B * K * (K - 1))
 
+    def atom_peak_penalty(self, atoms):
+        """
+        Penalize atoms that are too peaked/concentrated.
+
+        Encourages atoms to distribute their mass more evenly rather than
+        having a few very bright pixels. This helps prevent collapse to
+        dot-like structures and encourages more spread-out anatomical parts.
+
+        Args:
+            atoms: (B, K, 1, H, W) - Atom templates
+
+        Returns:
+            loss: Scalar - Peak penalty (minimize)
+        """
+        B, K, _, H, W = atoms.shape
+
+        # Flatten spatial dimensions
+        atoms_flat = atoms.view(B * K, -1)  # (B*K, H*W)
+
+        # Get max value for each atom
+        max_vals = atoms_flat.max(dim=-1)[0]  # (B*K,)
+
+        # Get mean value for each atom (excluding zeros)
+        atoms_abs = torch.abs(atoms_flat)
+        mean_vals = atoms_abs.sum(dim=-1) / (atoms_abs > 0).sum(dim=-1).clamp(min=1)
+
+        # Penalize large ratio between max and mean (peaked distributions)
+        # A flat distribution has ratio ~1, peaked has ratio >> 1
+        peak_ratio = max_vals / (mean_vals + 1e-8)
+
+        # Penalize ratios above 2.0 (allow some variation but not extreme peaks)
+        penalty = F.relu(peak_ratio - 2.0).mean()
+
+        return penalty
+
     def forward(self, h_original, h_composed, atoms, poses, attention, v_local=None, atoms_transformed=None):
         """
         Compute total loss with improved structural priors.
@@ -827,6 +864,7 @@ class RotoLDDMMLoss(nn.Module):
         loss_atom_tv = self.atom_total_variation_loss(atoms)
         loss_atom_compact = self.atom_compactness_loss(atoms)
         loss_usage_balance = self.atom_usage_balance_loss(attention)
+        loss_peak_penalty = self.atom_peak_penalty(atoms)
 
         # Compute overlap penalty if transformed atoms provided
         if atoms_transformed is not None:
@@ -845,7 +883,8 @@ class RotoLDDMMLoss(nn.Module):
             self.lambda_atom_tv * loss_atom_tv +
             self.lambda_atom_compactness * loss_atom_compact +
             self.lambda_atom_usage_balance * loss_usage_balance +
-            self.lambda_atom_overlap * loss_overlap
+            self.lambda_atom_overlap * loss_overlap +
+            self.lambda_atom_peak_penalty * loss_peak_penalty
         )
 
         return {
@@ -860,7 +899,8 @@ class RotoLDDMMLoss(nn.Module):
             'atom_tv': loss_atom_tv,
             'atom_compactness': loss_atom_compact,
             'usage_balance': loss_usage_balance,
-            'atom_overlap': loss_overlap
+            'atom_overlap': loss_overlap,
+            'atom_peak_penalty': loss_peak_penalty
         }
 
 
@@ -921,10 +961,11 @@ class RotoLDDMMTrainer:
             lambda_attention_sparsity=0.5,     # REDUCED: allow 6-8 atoms to collaborate (was 4.0)
             lambda_local_smooth=0.8,           # Keep warps smooth but allow organic curves
             lambda_mass_conservation=1.0,      # Standard
-            lambda_atom_tv=0.01,               # MINIMAL: allow anatomical detail (was 0.5)
-            lambda_atom_compactness=0.005,     # MINIMAL: allow elongated atoms (was 0.3)
+            lambda_atom_tv=0.1,                # INCREASED: encourage smoother, more spread-out atoms (was 0.01)
+            lambda_atom_compactness=0.0,       # REMOVED: allow atoms to spread naturally (was 0.005)
             lambda_atom_usage_balance=2.0,     # Prevent mode collapse
-            lambda_atom_overlap=0.1            # REDUCED: neck can be near head (was 1.0)
+            lambda_atom_overlap=0.1,           # REDUCED: neck can be near head (was 1.0)
+            lambda_atom_peak_penalty=0.5       # NEW: prevent overly peaked atoms (encourage distribution)
         ).to(device)
 
         self.history = defaultdict(list)
@@ -936,13 +977,14 @@ class RotoLDDMMTrainer:
         print(f"  Stage 1 - Warmup     (Epochs 1-5):   σ=2.5, Atoms Frozen")
         print(f"  Stage 2 - Discovery  (Epochs 6-20):  σ=2.0, High LR")
         print(f"  Stage 3 - Refinement (Epochs 21-40): σ→1.0 (slower drop, was →0.5)")
-        print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ→0 (from 1.0, was from 0.5)")
-        print(f"\nLoss Weights (V2.2 - RECONSTRUCTION DOMINATES):")
+        print(f"  Stage 4 - Finalize   (Epochs 41-{total_epochs}): σ→0.5 (maintain minimum blur)")
+        print(f"\nLoss Weights (V2.3 - ANTI-COLLAPSE UPDATE):")
         print(f"  - Reconstruction: 15.0 ★★★ CRITICAL - 15× increase to force dot matching!")
-        print(f"  - Atom TV: 0.01 (MINIMAL - allow anatomical detail, was 0.5)")
-        print(f"  - Atom Compactness: 0.005 (MINIMAL - allow elongated atoms, was 0.3)")
-        print(f"  - Attention Sparsity: 0.5 (allow 6-8 atoms to collaborate, was 4.0)")
-        print(f"  - Overlap Penalty: 0.1 (minimal - neck can be near head, was 1.0)")
+        print(f"  - Atom TV: 0.1 (encourage smooth/spread atoms, was 0.01)")
+        print(f"  - Atom Compactness: 0.0 (DISABLED - allow atoms to spread naturally)")
+        print(f"  - Atom Peak Penalty: 0.5 (NEW - prevent peaked/collapsed atoms)")
+        print(f"  - Attention Sparsity: 0.5 (allow 6-8 atoms to collaborate)")
+        print(f"  - Overlap Penalty: 0.1 (minimal - neck can be near head)")
         print(f"  - Atom Sparsity: 3.0 (moderate)")
         print(f"  - Atom Diversity: 2.0 (force different atoms)")
         print(f"  - Local Smooth: 0.8 (allow organic curves)")
@@ -991,10 +1033,11 @@ class RotoLDDMMTrainer:
                 'lr_multiplier': 0.5  # Moderate LR
             }
         else:  # Finalize
-            # UPDATED: Final drop from 1.0 to 0 (was 0.5 → 0)
+            # UPDATED: Final drop from 1.0 to 0.5 (maintain minimum blur for diffuse signal)
+            # This prevents atoms from collapsing to only match sharp peaks
             start_epoch, end_epoch = self.stage_boundaries['finalize']
             progress = (epoch - start_epoch) / (end_epoch - start_epoch)
-            sigma = 1.0 * (1 - progress)  # 1.0 → 0
+            sigma = 1.0 - progress * 0.5  # 1.0 → 0.5 (keep minimum blur)
             return {
                 'stage_name': 'Finalize',
                 'sigma': sigma,
@@ -1080,7 +1123,7 @@ class RotoLDDMMTrainer:
                 'loss': losses['total'].item(),
                 'recon★': losses['reconstruction'].item(),  # Primary signal
                 'tv': losses['atom_tv'].item(),
-                'cmpct': losses['atom_compactness'].item()
+                'peak': losses['atom_peak_penalty'].item()
             })
 
             if batch_idx % 50 == 0:
@@ -1114,9 +1157,10 @@ class RotoLDDMMTrainer:
             print(f"\nEpoch {epoch}/{num_epochs} Summary [{config['stage_name']}], σ={config['sigma']:.2f}:")
             print(f"  Total Loss: {avg_losses['total']:.4f}")
             print(f"  ★ Reconstruction: {avg_losses['reconstruction']:.4f} ← PRIMARY SIGNAL (×15.0)")
-            print(f"  Atom TV: {avg_losses['atom_tv']:.6f} (minimal, ×0.01 - allow detail)")
-            print(f"  Atom Compactness: {avg_losses['atom_compactness']:.6f} (minimal, ×0.005 - allow stretch)")
-            print(f"  Atom Overlap: {avg_losses['atom_overlap']:.4f} (minimal, ×0.1 - allow proximity)")
+            print(f"  Atom TV: {avg_losses['atom_tv']:.6f} (×0.1 - encourage smooth/spread atoms)")
+            print(f"  Atom Compactness: {avg_losses['atom_compactness']:.6f} (×0.0 - DISABLED)")
+            print(f"  Atom Peak Penalty: {avg_losses['atom_peak_penalty']:.4f} (×0.5 - prevent collapse)")
+            print(f"  Atom Overlap: {avg_losses['atom_overlap']:.4f} (×0.1 - allow proximity)")
             print(f"  Attention Sparsity: {avg_losses['attention_sparsity']:.4f} (×0.5 - encourage collaboration)")
             print(f"  Usage Balance: {avg_losses['usage_balance']:.6f} (uniform atom usage)")
             print(f"  Atom Diversity: {avg_losses['atom_diversity']:.4f} (different atoms)")
