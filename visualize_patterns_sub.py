@@ -34,7 +34,7 @@ from torchvision import transforms
 # Import model components
 import sys
 sys.path.append('.')
-from geo_patterns import LDDMM_GlobalPatternPipeline
+from misc.geo_patterns import LDDMM_GlobalPatternPipeline
 from geo_s2_sub import AdvancedLDDMM_Pipeline  # Import from subset version
 from full_classes import IMAGENET2012_CLASSES
 
