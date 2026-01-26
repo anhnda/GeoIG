@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
 import joblib
+import math
 from PIL import Image
 from torchvision import transforms
 
@@ -412,8 +413,9 @@ class PatternVisualizerSubset:
         templates = self.model.templates[class_id].cpu().numpy()  # (K, 1, H, W)
         counts = self.model.template_counts[class_id].cpu().numpy()  # (K,)
 
-        # Create visualization
-        fig, axes = plt.subplots(2, self.k_subpatterns // 2, figsize=(20, 8))
+        # Create visualization - handle odd numbers of subpatterns
+        ncols = math.ceil(self.k_subpatterns / 2)
+        fig, axes = plt.subplots(2, ncols, figsize=(4*ncols, 8))
         axes = axes.flatten()
 
         fig.suptitle(f'Learned Sub-Patterns for {class_name} (Class {class_id}) - SUBSET',
@@ -434,6 +436,10 @@ class PatternVisualizerSubset:
             ax.set_title(f'Pattern {k}\nUsage: {int(counts[k])} ({usage_pct:.1f}%)',
                         fontsize=10)
             ax.axis('off')
+
+        # Hide unused subplots (for odd number of patterns)
+        for k in range(self.k_subpatterns, len(axes)):
+            axes[k].axis('off')
 
         plt.tight_layout()
 
